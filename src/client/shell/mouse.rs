@@ -715,7 +715,13 @@ impl ClientShellState {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
+    /// `now` is shared by every event in the input batch this one arrived in.
+    pub(super) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        now: std::time::Instant,
+        outcome: &mut ClientShellInput,
+    ) {
         let point = (mouse.column, mouse.row);
         if self.mode == ClientShellMode::Navigate
             && self.workspace_preview_action_blocked()
@@ -1882,7 +1888,7 @@ impl ClientShellState {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => -1,
                     _ => 1,
                 };
-                self.push_tab_swipe(delta, std::time::Instant::now(), outcome);
+                self.push_tab_swipe(delta, now, outcome);
             }
             MouseEventKind::ScrollUp if super::contains(self.hits.agent_body, point) => {
                 let next = self.agent_scroll.saturating_sub(1);

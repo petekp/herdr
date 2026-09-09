@@ -29,12 +29,8 @@ pub(crate) fn render_tab_bar(
         (swipe.progress > 0.0 && swipe.progress < 1.0).then_some((
             swipe.origin_tab_id.as_str(),
             swipe.target_tab_id.as_deref()?,
-            swipe.progress,
         ))
     });
-    let swipe_wrap = tab_swipe
-        .filter(|swipe| swipe.wraps)
-        .map(|swipe| swipe.direction);
     let mut swipe_origin: Option<(Rect, Style)> = None;
     let mut swipe_target: Option<Rect> = None;
     buffer.set_style(area, Style::default().bg(palette.panel_bg));
@@ -143,7 +139,7 @@ pub(crate) fn render_tab_bar(
         } else {
             unfocused_style
         };
-        if let Some((origin_id, target_id, _)) = swipe_overlay {
+        if let Some((origin_id, target_id)) = swipe_overlay {
             if tab.tab_id == origin_id {
                 swipe_origin = Some((rect, unfocused_style));
             } else if tab.tab_id == target_id {
@@ -168,21 +164,27 @@ pub(crate) fn render_tab_bar(
         }
     }
 
-    if let (Some((_, _, progress)), Some((origin, origin_style))) = (swipe_overlay, swipe_origin) {
-        match (swipe_wrap, swipe_target) {
-            (Some(direction), target) => render_tab_swipe_wrap(
+    if let (Some(swipe), Some((origin, origin_style))) = (tab_swipe, swipe_origin) {
+        match swipe_target {
+            Some(target) if !swipe.wraps => render_tab_swipe_fill(
                 buffer,
                 palette,
                 origin,
                 origin_style,
                 target,
-                direction,
-                progress,
+                swipe.progress,
             ),
-            (None, Some(target)) => {
-                render_tab_swipe_fill(buffer, palette, origin, origin_style, target, progress)
-            }
-            (None, None) => {}
+            // Wrapping around the strip, or a neighbor scrolled out of view:
+            // the fill leaves the origin through the strip's edge.
+            target => render_tab_swipe_drain(
+                buffer,
+                palette,
+                origin,
+                origin_style,
+                target,
+                swipe.direction,
+                swipe.progress,
+            ),
         }
     }
 
@@ -300,11 +302,11 @@ fn render_tab_swipe_fill(
     );
 }
 
-/// Draws a fill wrapping from one end of the strip to the other. The fill
-/// drains out of the origin through the strip's edge while the same share
-/// grows into the target from its far side. A target that is scrolled out of
-/// view only shows the draining half.
-fn render_tab_swipe_wrap(
+/// Draws a fill leaving the origin through the strip's edge in the swipe
+/// direction while the same share grows into the target from its far side.
+/// Used when the swipe wraps around the strip and when the neighbor is
+/// scrolled out of view; without a visible target only the draining half shows.
+fn render_tab_swipe_drain(
     buffer: &mut Buffer,
     palette: &Palette,
     origin: Rect,

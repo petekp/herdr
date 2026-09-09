@@ -514,6 +514,62 @@ fn wrapping_swipe_drains_the_origin_and_fills_the_far_tab_from_its_edge() {
 }
 
 #[test]
+fn swipe_toward_a_neighbor_scrolled_out_of_view_drains_the_origin_toward_that_edge() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut snapshot = snapshot();
+    snapshot.tabs.extend((2..=8).map(|number| ClientShellTab {
+        tab_id: format!("tab_{number}"),
+        workspace_id: "ws_1".into(),
+        number,
+        label: number.to_string(),
+        custom_label: false,
+        zoomed: false,
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    }));
+    snapshot.focused_tab_id = Some("tab_4".into());
+    for tab in &mut snapshot.tabs {
+        tab.focused = tab.tab_id == "tab_4";
+    }
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.compose(80, 20).expect("overflow tab bar");
+    // Scroll the strip so tab 4 is the first visible tab and tab 3 is hidden.
+    state.tab_scroll = 3;
+    state.reveal_focused_tab = false;
+    state.compose(80, 20).expect("scrolled tab bar");
+    assert!(state.hits.tab_scroll_left.width > 0, "strip overflows");
+    assert!(
+        !state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_3"),
+        "previous tab is out of view"
+    );
+    let origin = state
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| tab_id == "tab_4")
+        .map(|(rect, _)| *rect)
+        .expect("focused tab visible");
+    let accent = state.config.palette.accent;
+
+    wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold / 2);
+    let frame = state.compose(80, 20).expect("mid-swipe tab bar");
+    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+    let bg_at = |x: u16| buffer.cell((x, origin.y)).expect("tab cell").bg;
+    assert_eq!(
+        bg_at(origin.x),
+        accent,
+        "fill hugs the edge the hidden neighbor is behind"
+    );
+    assert_ne!(
+        bg_at(origin.right() - 1),
+        accent,
+        "far side of the origin has drained"
+    );
+}
+
+#[test]
 fn one_wheel_burst_switches_at_most_one_tab() {
     let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
     let mut state = three_tab_state("tab_1");

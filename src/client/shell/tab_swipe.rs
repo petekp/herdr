@@ -14,7 +14,12 @@ const TAB_SWIPE_FRAME: Duration = Duration::from_millis(16);
 /// Events closer together than this only come from trackpads, which emit
 /// several per frame. Discrete mouse notches never arrive this fast.
 const FAST_GAP: Duration = Duration::from_millis(20);
-/// Gap at or above which an event counts as a discrete notch.
+/// Fast gaps seen before the gesture counts as trackpad input. One is not
+/// enough: a busy client can read two wheel notches in one batch.
+const TRACKPAD_FAST_EVENTS: u32 = 2;
+/// Gap at or above which an event counts as a discrete notch. Gaps between
+/// the two limits are ambiguous, a fast wheel flick or a moderate trackpad
+/// swipe, and weigh 1 so the rarer failure is a switch that needs more input.
 const SPARSE_GAP: Duration = Duration::from_millis(40);
 /// Weight of a discrete notch, so a mouse wheel switches in a handful of clicks.
 const SPARSE_EVENT_WEIGHT: i32 = 8;
@@ -27,6 +32,10 @@ const RESUME_MIN_EVENTS: usize = 12;
 /// ...and how much faster than the previous window it has to be. Momentum
 /// only decays, so a rise this sharp means the fingers came back.
 const RESUME_RATIO: f32 = 2.5;
+/// A batch of events that follows a gap this long is a stalled client catching
+/// up on its backlog, not a fresh burst. Events read in one batch share a
+/// timestamp, so the rate test skips the history window they land in.
+const STALL_GAP: Duration = Duration::from_millis(50);
 
 /// A wheel-driven tab switch in progress. Wheel events carry no distance, so
 /// the gesture counts them and commits once one direction reaches the threshold.
@@ -50,6 +59,10 @@ pub(super) struct TabSwipe {
     commit_at: Option<Instant>,
     last_input: Instant,
     last_event: Option<Instant>,
+    /// Gap before the current input batch.
+    batch_gap: Option<Duration>,
+    /// When a batch last arrived after a stall.
+    stalled_at: Option<Instant>,
     fast_events: u32,
     /// Event times within the last two resume windows.
     recent: VecDeque<Instant>,
@@ -111,14 +124,17 @@ impl TabSwipe {
             commit_at: None,
             last_input: now,
             last_event: None,
+            batch_gap: None,
+            stalled_at: None,
             fast_events: 0,
             recent: VecDeque::new(),
             phase: TabSwipePhase::Tracking,
         }
     }
 
-    /// Feeds one wheel event. Directions without a neighbor make no progress,
-    /// so the strip never wraps.
+    /// Feeds one wheel event. A direction without a neighbor makes no
+    /// progress; the strip wraps only when the caller supplies the far tab as
+    /// that neighbor.
     pub(super) fn push(
         &mut self,
         delta: i32,
@@ -126,6 +142,16 @@ impl TabSwipe {
         now: Instant,
     ) -> TabSwipePush {
         let gap = self.last_event.map(|last| now.duration_since(last));
+        if gap == Some(Duration::ZERO) {
+            if self
+                .batch_gap
+                .is_some_and(|batch_gap| batch_gap >= STALL_GAP)
+            {
+                self.stalled_at = Some(now);
+            }
+        } else {
+            self.batch_gap = gap;
+        }
         self.last_event = Some(now);
         self.last_input = now;
         self.recent.push_back(now);
@@ -139,7 +165,8 @@ impl TabSwipe {
         if gap.is_some_and(|gap| gap < FAST_GAP) {
             self.fast_events += 1;
         }
-        let weight = if self.fast_events == 0 && gap.is_some_and(|gap| gap >= SPARSE_GAP) {
+        let discrete_notch = !self.trackpad_input() && gap.is_some_and(|gap| gap >= SPARSE_GAP);
+        let weight = if discrete_notch {
             SPARSE_EVENT_WEIGHT
         } else {
             1
@@ -153,7 +180,10 @@ impl TabSwipe {
                 self.phase = TabSwipePhase::Tracking;
             }
             TabSwipePhase::Settling { .. } | TabSwipePhase::Cooldown => {
-                if self.fresh_swipe(delta, now) {
+                // A notch cannot be momentum: nothing coasts at wheel rates.
+                // It starts the next swipe at once, so a wheel keeps switching
+                // tabs for as long as it keeps turning.
+                if discrete_notch || self.fresh_swipe(delta, now) {
                     return TabSwipePush::Restart;
                 }
                 return TabSwipePush::Continue;
@@ -194,8 +224,12 @@ impl TabSwipe {
         TabSwipePush::Continue
     }
 
-    /// Whether an event arriving after a commit belongs to a new swipe rather
-    /// than the momentum tail of the one that committed.
+    fn trackpad_input(&self) -> bool {
+        self.fast_events >= TRACKPAD_FAST_EVENTS
+    }
+
+    /// Whether a trackpad event arriving after a commit belongs to a new swipe
+    /// rather than the momentum tail of the one that committed.
     fn fresh_swipe(&self, delta: i32, now: Instant) -> bool {
         let (Some(direction), Some(commit_at)) = (self.committed, self.commit_at) else {
             return false;
@@ -205,6 +239,12 @@ impl TabSwipe {
         }
         if delta.signum() != direction {
             return true;
+        }
+        if self
+            .stalled_at
+            .is_some_and(|stalled_at| now.duration_since(stalled_at) <= RESUME_WINDOW * 2)
+        {
+            return false;
         }
         let recent = self
             .recent
@@ -442,6 +482,71 @@ mod tests {
             at += Duration::from_millis(80);
         }
         assert_eq!(notches, 7);
+    }
+
+    #[test]
+    fn wheel_notches_keep_switching_tabs_without_a_pause() {
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        let mut at = now;
+        let mut results = Vec::new();
+        for _ in 0..7 {
+            results.push(swipe.push(1, neighbors(), at));
+            at += Duration::from_millis(80);
+        }
+        assert_eq!(
+            results.last(),
+            Some(&TabSwipePush::Commit("tab_next".into()))
+        );
+        // The next notch lands during the settle and starts a new swipe
+        // instead of being swallowed as momentum, in either direction.
+        assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Restart);
+        at += Duration::from_millis(80);
+        assert_eq!(swipe.push(-1, neighbors(), at), TabSwipePush::Restart);
+    }
+
+    #[test]
+    fn one_batched_notch_pair_keeps_wheel_weighting() {
+        // A busy client read two notches in one batch, so they share an instant.
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
+        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
+        let mut at = now;
+        let mut notches = 2;
+        loop {
+            at += Duration::from_millis(80);
+            notches += 1;
+            if swipe.push(1, neighbors(), at) == TabSwipePush::Commit("tab_next".into()) {
+                break;
+            }
+            assert!(notches < 10, "wheel needs too many notches");
+        }
+        assert_eq!(notches, 8);
+    }
+
+    #[test]
+    fn a_stalled_client_batching_the_momentum_tail_does_not_restart() {
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        // Momentum at 10ms gaps, processed on time.
+        for _ in 0..16 {
+            at += Duration::from_millis(10);
+            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            swipe.tick(at);
+        }
+        // The client stalls for 200ms, then processes the 20 tail events that
+        // queued up meanwhile as one batch, all stamped with the same instant.
+        at += Duration::from_millis(200);
+        for _ in 0..20 {
+            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+        }
+        // The rest of the tail is processed on time again.
+        for _ in 0..10 {
+            at += Duration::from_millis(10);
+            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+        }
     }
 
     #[test]

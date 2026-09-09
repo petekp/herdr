@@ -156,6 +156,9 @@ impl ClientShellState {
     }
 
     pub(super) fn handle_raw_events(&mut self, events: Vec<RawInputEvent>) -> ClientShellInput {
+        // One timestamp per batch: events read together share it, which is
+        // how the tab swipe tells a stalled client's backlog from live input.
+        let now = std::time::Instant::now();
         let mut outcome = ClientShellInput::default();
         if !events.is_empty() && self.endpoint_error.take().is_some() {
             outcome.repaint = true;
@@ -233,7 +236,7 @@ impl ClientShellState {
                         }
                     }
                 }
-                RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, &mut outcome),
+                RawInputEvent::Mouse(mouse) => self.handle_mouse(mouse, now, &mut outcome),
                 RawInputEvent::OuterFocusGained => {
                     self.outer_focused = Some(true);
                     outcome.query_host_appearance = true;
