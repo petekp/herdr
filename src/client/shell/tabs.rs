@@ -12,9 +12,31 @@ pub(crate) fn render_tab_bar(
     tab_scroll: &mut usize,
     reveal_focused_tab: &mut bool,
     tab_drag_insert_index: Option<usize>,
+    tab_swipe: Option<&super::super::tab_swipe::TabSwipe>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
+    // While a swipe is in flight the filled tab follows the gesture, not the
+    // snapshot, so a focus change mid-animation does not jump.
+    let swipe_anchor = tab_swipe.and_then(|swipe| {
+        if swipe.progress >= 1.0 {
+            swipe.target_tab_id.as_deref()
+        } else {
+            Some(swipe.origin_tab_id.as_str())
+        }
+    });
+    let swipe_overlay = tab_swipe.and_then(|swipe| {
+        (swipe.progress > 0.0 && swipe.progress < 1.0).then_some((
+            swipe.origin_tab_id.as_str(),
+            swipe.target_tab_id.as_deref()?,
+            swipe.progress,
+        ))
+    });
+    let swipe_wrap = tab_swipe
+        .filter(|swipe| swipe.wraps)
+        .map(|swipe| swipe.direction);
+    let mut swipe_origin: Option<(Rect, Style)> = None;
+    let mut swipe_target: Option<Rect> = None;
     buffer.set_style(area, Style::default().bg(palette.panel_bg));
     let tabs = snapshot
         .tabs
@@ -100,7 +122,16 @@ pub(crate) fn render_tab_bar(
             break;
         }
         let rect = Rect::new(x, area.y, width, 1);
-        let style = if tab.focused {
+        let focused = swipe_anchor.map_or(tab.focused, |anchor| anchor == tab.tab_id);
+        let unfocused_style = if tab.custom_label {
+            Style::default().fg(palette.overlay1).bg(palette.surface0)
+        } else {
+            Style::default()
+                .fg(palette.overlay0)
+                .bg(palette.surface0)
+                .add_modifier(Modifier::DIM)
+        };
+        let style = if focused {
             let base = Style::default()
                 .fg(panel_contrast_fg(palette))
                 .bg(palette.accent);
@@ -109,14 +140,16 @@ pub(crate) fn render_tab_bar(
             } else {
                 base
             }
-        } else if tab.custom_label {
-            Style::default().fg(palette.overlay1).bg(palette.surface0)
         } else {
-            Style::default()
-                .fg(palette.overlay0)
-                .bg(palette.surface0)
-                .add_modifier(Modifier::DIM)
+            unfocused_style
         };
+        if let Some((origin_id, target_id, _)) = swipe_overlay {
+            if tab.tab_id == origin_id {
+                swipe_origin = Some((rect, unfocused_style));
+            } else if tab.tab_id == target_id {
+                swipe_target = Some(rect);
+            }
+        }
         let padding = width.saturating_sub(display_width(&name));
         let left = padding / 2;
         let text = format!(
@@ -132,6 +165,24 @@ pub(crate) fn render_tab_bar(
         x = x.saturating_add(width + 1);
         if width < desired {
             break;
+        }
+    }
+
+    if let (Some((_, _, progress)), Some((origin, origin_style))) = (swipe_overlay, swipe_origin) {
+        match (swipe_wrap, swipe_target) {
+            (Some(direction), target) => render_tab_swipe_wrap(
+                buffer,
+                palette,
+                origin,
+                origin_style,
+                target,
+                direction,
+                progress,
+            ),
+            (None, Some(target)) => {
+                render_tab_swipe_fill(buffer, palette, origin, origin_style, target, progress)
+            }
+            (None, None) => {}
         }
     }
 
@@ -224,6 +275,128 @@ pub(crate) fn render_tab_bar(
         }
     }
     render_tab_bar_status(buffer, area, snapshot, palette);
+}
+
+/// Left-aligned partial blocks, indexed by eighths filled.
+const SWIPE_EDGE_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+/// Draws the focused-tab fill part way between the origin and target tabs.
+fn render_tab_swipe_fill(
+    buffer: &mut Buffer,
+    palette: &Palette,
+    origin: Rect,
+    origin_style: Style,
+    target: Rect,
+    progress: f32,
+) {
+    buffer.set_style(origin, origin_style.remove_modifier(Modifier::BOLD));
+    let lerp = |from: u16, to: u16| f32::from(from) + (f32::from(to) - f32::from(from)) * progress;
+    paint_fill_span(
+        buffer,
+        palette,
+        origin.y,
+        lerp(origin.x, target.x),
+        lerp(origin.right(), target.right()),
+    );
+}
+
+/// Draws a fill wrapping from one end of the strip to the other. The fill
+/// drains out of the origin through the strip's edge while the same share
+/// grows into the target from its far side. A target that is scrolled out of
+/// view only shows the draining half.
+fn render_tab_swipe_wrap(
+    buffer: &mut Buffer,
+    palette: &Palette,
+    origin: Rect,
+    origin_style: Style,
+    target: Option<Rect>,
+    direction: i32,
+    progress: f32,
+) {
+    buffer.set_style(origin, origin_style.remove_modifier(Modifier::BOLD));
+    let remaining = f32::from(origin.width) * (1.0 - progress);
+    let entered = target.map_or(0.0, |target| f32::from(target.width) * progress);
+    let y = origin.y;
+    if direction < 0 {
+        paint_fill_span(
+            buffer,
+            palette,
+            y,
+            f32::from(origin.x),
+            f32::from(origin.x) + remaining,
+        );
+        if let Some(target) = target {
+            let right = f32::from(target.right());
+            paint_fill_span(buffer, palette, y, right - entered, right);
+        }
+    } else {
+        let right = f32::from(origin.right());
+        paint_fill_span(buffer, palette, y, right - remaining, right);
+        if let Some(target) = target {
+            let left = f32::from(target.x);
+            paint_fill_span(buffer, palette, y, left, left + entered);
+        }
+    }
+}
+
+/// Style for a partial-block edge cell. The tab's own dim and bold attributes
+/// must not survive here: dim darkens the block glyph, which reads as a darker
+/// sliver of fill at the moving edge.
+fn edge_style(fg: ratatui::style::Color, bg: ratatui::style::Color) -> Style {
+    Style::default()
+        .fg(fg)
+        .bg(bg)
+        .remove_modifier(Modifier::DIM | Modifier::BOLD)
+}
+
+/// Paints the focused style over the fractional cell span `start..end` on
+/// one row. Whole cells keep their text. The two edge cells use partial
+/// block glyphs so the fill moves in eighths of a cell.
+fn paint_fill_span(buffer: &mut Buffer, palette: &Palette, y: u16, start: f32, end: f32) {
+    if end <= start || end.floor() == start.floor() {
+        return;
+    }
+    let filled = Style::default()
+        .fg(panel_contrast_fg(palette))
+        .bg(palette.accent)
+        .remove_modifier(Modifier::DIM);
+    let mut x = start.ceil();
+    while x < end.floor() {
+        if let Some(cell) = buffer.cell_mut((x as u16, y)) {
+            cell.set_style(filled);
+        }
+        x += 1.0;
+    }
+    // Leading edge: the left part of the cell keeps its old color.
+    let leading_uncovered = ((start - start.floor()) * 8.0).round() as usize;
+    if let Some(cell) = buffer.cell_mut((start.floor() as u16, y)) {
+        match leading_uncovered {
+            0 => {
+                cell.set_style(filled);
+            }
+            8 => {}
+            eighths => {
+                let uncovered = cell.style().bg.unwrap_or(palette.panel_bg);
+                cell.set_symbol(SWIPE_EDGE_BLOCKS[eighths]);
+                cell.set_style(edge_style(uncovered, palette.accent));
+            }
+        }
+    }
+    // Trailing edge: the left part of the cell takes the accent color.
+    let trailing_covered = ((end - end.floor()) * 8.0).round() as usize;
+    if let Some(cell) = buffer.cell_mut((end.floor() as u16, y)) {
+        match trailing_covered {
+            0 => {}
+            8 => {
+                cell.set_style(filled);
+            }
+            eighths => {
+                let uncovered = cell.style().bg.unwrap_or(palette.panel_bg);
+                cell.set_symbol(SWIPE_EDGE_BLOCKS[eighths]);
+                cell.set_style(edge_style(palette.accent, uncovered));
+            }
+        }
+    }
 }
 
 pub(crate) fn tab_bar_status_width(snapshot: &ClientShellSnapshot) -> u16 {

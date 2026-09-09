@@ -935,6 +935,12 @@
           "description": "Lines to scroll per mouse wheel notch."
         },
         {
+          "key": "ui.tab_swipe_extra_rows",
+          "type": "integer",
+          "default": "0",
+          "description": "Extra rows beside the tab row, toward the panes, where a horizontal wheel swipe still switches tabs."
+        },
+        {
           "key": "ui.confirm_close",
           "type": "boolean",
           "default": "true",

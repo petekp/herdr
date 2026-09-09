@@ -404,6 +404,116 @@ impl ClientShellState {
         ((pointer + grab_offset - origin) as f32 / f32::from(length.max(1))).clamp(0.1, 0.9)
     }
 
+    /// Whether a wheel event at `point` drives the tab swipe. Any wheel
+    /// direction counts on the tab row itself. In the configured extra rows
+    /// beside it only horizontal wheel counts, so pane scrolling keeps working.
+    fn wheel_swipes_tabs(&self, kind: MouseEventKind, point: (u16, u16)) -> bool {
+        let bar = self.hits.tab_bar;
+        if bar.is_empty() {
+            return false;
+        }
+        if super::contains(bar, point) {
+            return true;
+        }
+        if !matches!(
+            kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            return false;
+        }
+        let extra = self.config.tab_swipe_extra_rows;
+        let slop = match self.config.tab_bar_position {
+            TabBarPositionConfig::Top => Rect::new(bar.x, bar.bottom(), bar.width, extra),
+            TabBarPositionConfig::Bottom => {
+                let top = bar.y.saturating_sub(extra);
+                Rect::new(bar.x, top, bar.width, bar.y - top)
+            }
+        };
+        super::contains(slop, point)
+    }
+
+    /// Feeds one wheel event over the tab strip into the swipe gesture.
+    fn push_tab_swipe(
+        &mut self,
+        delta: i32,
+        now: std::time::Instant,
+        outcome: &mut ClientShellInput,
+    ) {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return;
+        };
+        let Some(workspace_id) = snapshot.focused_workspace_id.clone() else {
+            return;
+        };
+        let tab_ids = snapshot
+            .tabs
+            .iter()
+            .filter(|tab| tab.workspace_id == workspace_id)
+            .map(|tab| tab.tab_id.clone())
+            .collect::<Vec<_>>();
+        let mut origin = self
+            .tab_swipe
+            .as_ref()
+            .map(|swipe| swipe.origin_tab_id.clone())
+            .or_else(|| snapshot.focused_tab_id.clone());
+        // A restart replays the event into a new gesture, so at most two passes.
+        for _ in 0..2 {
+            let Some(origin_id) = origin.take() else {
+                return;
+            };
+            let Some(origin_index) = tab_ids.iter().position(|tab_id| *tab_id == origin_id) else {
+                self.tab_swipe = None;
+                return;
+            };
+            let count = tab_ids.len();
+            let previous_wraps = origin_index == 0 && count > 1;
+            let next_wraps = origin_index + 1 >= count && count > 1;
+            let neighbors = super::tab_swipe::TabSwipeNeighbors {
+                previous: if previous_wraps {
+                    tab_ids.last().map(String::as_str)
+                } else {
+                    origin_index
+                        .checked_sub(1)
+                        .map(|index| tab_ids[index].as_str())
+                },
+                next: if next_wraps {
+                    tab_ids.first().map(String::as_str)
+                } else {
+                    tab_ids.get(origin_index + 1).map(String::as_str)
+                },
+                previous_wraps,
+                next_wraps,
+            };
+            let swipe = self.tab_swipe.get_or_insert_with(|| {
+                super::tab_swipe::TabSwipe::begin(workspace_id.clone(), origin_id, now)
+            });
+            let before = swipe.progress;
+            match swipe.push(delta, neighbors, now) {
+                super::tab_swipe::TabSwipePush::Continue => {
+                    outcome.repaint |= swipe.progress != before;
+                    return;
+                }
+                super::tab_swipe::TabSwipePush::Commit(tab_id) => {
+                    outcome.repaint = true;
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+                            tab_id,
+                        }),
+                        outcome,
+                    );
+                    return;
+                }
+                super::tab_swipe::TabSwipePush::Restart => {
+                    // The new swipe starts from the tab the last one switched to,
+                    // even if the snapshot has not caught up yet.
+                    origin = swipe.target_tab_id.clone();
+                    self.tab_swipe = None;
+                    outcome.repaint = true;
+                }
+            }
+        }
+    }
+
     fn tab_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
         let snapshot = self.snapshot.as_deref()?;
         let workspace_id = snapshot.focused_workspace_id.as_deref()?;
@@ -1763,34 +1873,16 @@ impl ClientShellState {
                 }
             }
             MouseEventKind::ScrollUp
-                if self
-                    .hits
-                    .tabs
-                    .iter()
-                    .any(|(rect, _)| super::contains(*rect, point))
-                    || super::contains(self.hits.tab_scroll_left, point)
-                    || super::contains(self.hits.tab_scroll_right, point)
-                    || super::contains(self.hits.new_tab, point) =>
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+                if self.wheel_swipes_tabs(mouse.kind, point) =>
             {
-                self.record_binding(
-                    crate::input::KeybindMatch::Action(crate::input::KeybindAction::PreviousTab),
-                    outcome,
-                );
-            }
-            MouseEventKind::ScrollDown
-                if self
-                    .hits
-                    .tabs
-                    .iter()
-                    .any(|(rect, _)| super::contains(*rect, point))
-                    || super::contains(self.hits.tab_scroll_left, point)
-                    || super::contains(self.hits.tab_scroll_right, point)
-                    || super::contains(self.hits.new_tab, point) =>
-            {
-                self.record_binding(
-                    crate::input::KeybindMatch::Action(crate::input::KeybindAction::NextTab),
-                    outcome,
-                );
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => -1,
+                    _ => 1,
+                };
+                self.push_tab_swipe(delta, std::time::Instant::now(), outcome);
             }
             MouseEventKind::ScrollUp if super::contains(self.hits.agent_body, point) => {
                 let next = self.agent_scroll.saturating_sub(1);

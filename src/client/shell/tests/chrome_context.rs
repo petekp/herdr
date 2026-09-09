@@ -384,3 +384,244 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
             if params.workspace_id == "ws_1" && params.close_group
     ));
 }
+
+fn three_tab_state(focused: &str) -> ClientShellState {
+    three_tab_state_with_config(focused, Config::default())
+}
+
+fn three_tab_state_with_config(focused: &str, config: Config) -> ClientShellState {
+    let mut snapshot = snapshot();
+    snapshot.tabs.extend((2..=3).map(|number| ClientShellTab {
+        tab_id: format!("tab_{number}"),
+        workspace_id: "ws_1".into(),
+        number,
+        label: number.to_string(),
+        custom_label: false,
+        zoomed: false,
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    }));
+    snapshot.focused_tab_id = Some(focused.into());
+    for tab in &mut snapshot.tabs {
+        tab.focused = tab.tab_id == focused;
+    }
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.compose(106, 20).expect("three tab bar");
+    state
+}
+
+fn wheel_at(state: &mut ClientShellState, kind: MouseEventKind, column: u16, row: u16) {
+    state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::empty(),
+    })]);
+}
+
+fn wheel_over_tab(
+    state: &mut ClientShellState,
+    kind: MouseEventKind,
+    count: u32,
+) -> ClientShellInput {
+    let focused = state
+        .snapshot
+        .as_deref()
+        .and_then(|snapshot| snapshot.focused_tab_id.clone())
+        .expect("focused tab");
+    let tab = state
+        .hits
+        .tabs
+        .iter()
+        .find(|(_, tab_id)| *tab_id == focused)
+        .map(|(rect, _)| *rect)
+        .expect("focused tab hit");
+    state.handle_raw_events(
+        (0..count)
+            .map(|_| {
+                RawInputEvent::Mouse(MouseEvent {
+                    kind,
+                    column: tab.x,
+                    row: tab.y,
+                    modifiers: KeyModifiers::empty(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn focused_tab_request(outcome: &ClientShellInput) -> Option<String> {
+    outcome.actions.iter().find_map(|action| match action {
+        ClientShellAction::Endpoint { request, .. } => match &request.method {
+            crate::api::schema::Method::TabFocus(target) => Some(target.tab_id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+#[test]
+fn horizontal_wheel_swipes_toward_the_neighbor_in_that_direction() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_2");
+    let short = wheel_over_tab(&mut state, MouseEventKind::ScrollRight, threshold - 1);
+    assert!(short.repaint);
+    assert_eq!(focused_tab_request(&short), None);
+    let commit = wheel_over_tab(&mut state, MouseEventKind::ScrollRight, 1);
+    assert_eq!(focused_tab_request(&commit).as_deref(), Some("tab_3"));
+
+    let mut state = three_tab_state("tab_2");
+    let commit = wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold);
+    assert_eq!(focused_tab_request(&commit).as_deref(), Some("tab_1"));
+}
+
+#[test]
+fn swiping_past_either_end_wraps_to_the_other() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_3");
+    let outcome = wheel_over_tab(&mut state, MouseEventKind::ScrollRight, threshold);
+    assert_eq!(focused_tab_request(&outcome).as_deref(), Some("tab_1"));
+    let mut state = three_tab_state("tab_1");
+    let outcome = wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold);
+    assert_eq!(focused_tab_request(&outcome).as_deref(), Some("tab_3"));
+}
+
+#[test]
+fn wrapping_swipe_drains_the_origin_and_fills_the_far_tab_from_its_edge() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_1");
+    let origin = state.hits.tabs[0].0;
+    let last = state.hits.tabs[2].0;
+    let accent = state.config.palette.accent;
+    wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold / 2);
+    let frame = state.compose(106, 20).expect("mid-wrap tab bar");
+    let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+    let bg_at = |x: u16| buffer.cell((x, origin.y)).expect("tab cell").bg;
+    assert_eq!(bg_at(origin.x), accent, "origin keeps its left half");
+    assert_ne!(
+        bg_at(origin.right() - 1),
+        accent,
+        "origin has drained on the right"
+    );
+    assert_eq!(
+        bg_at(last.right() - 1),
+        accent,
+        "last tab fills from its right edge"
+    );
+    assert_ne!(bg_at(last.x), accent, "last tab's left half is still empty");
+}
+
+#[test]
+fn one_wheel_burst_switches_at_most_one_tab() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_1");
+    let outcome = wheel_over_tab(&mut state, MouseEventKind::ScrollRight, threshold * 4);
+    let switches = outcome
+        .actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                ClientShellAction::Endpoint { request, .. }
+                    if matches!(request.method, crate::api::schema::Method::TabFocus(_))
+            )
+        })
+        .count();
+    assert_eq!(switches, 1);
+    assert_eq!(focused_tab_request(&outcome).as_deref(), Some("tab_2"));
+
+    // Once the burst goes quiet the next swipe starts fresh from the new tab.
+    let quiet = std::time::Instant::now()
+        + crate::client::shell::tab_swipe::TAB_SWIPE_SETTLE
+        + crate::client::shell::tab_swipe::TAB_SWIPE_IDLE;
+    assert!(state.tick_tab_swipe(quiet));
+    assert!(state.tab_swipe.is_none());
+}
+
+#[test]
+fn partial_swipe_slides_the_fill_and_snaps_back_when_idle() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_1");
+    let origin = state.hits.tabs[0].0;
+    let accent = state.config.palette.accent;
+    let bg_at = |frame: &FrameData, x: u16| {
+        frame
+            .to_ratatui_buffer()
+            .expect("frame buffer")
+            .cell((x, origin.y))
+            .expect("tab cell")
+            .bg
+    };
+    wheel_over_tab(&mut state, MouseEventKind::ScrollRight, threshold / 2);
+    let frame = state.compose(106, 20).expect("mid-swipe tab bar");
+    assert_ne!(
+        bg_at(&frame, origin.x),
+        accent,
+        "fill has left the origin edge"
+    );
+    assert_eq!(
+        bg_at(&frame, origin.right() - 1),
+        accent,
+        "fill still covers the origin"
+    );
+
+    let idle_at = std::time::Instant::now() + crate::client::shell::tab_swipe::TAB_SWIPE_IDLE;
+    state.tick_tab_swipe(idle_at);
+    assert!(state.tick_tab_swipe(idle_at + crate::client::shell::tab_swipe::TAB_SWIPE_SETTLE));
+    assert!(state.tab_swipe.is_none());
+    let frame = state.compose(106, 20).expect("settled tab bar");
+    assert_eq!(bg_at(&frame, origin.x), accent);
+}
+
+#[test]
+fn the_whole_tab_row_is_swipeable_including_gaps_and_empty_space() {
+    let mut state = three_tab_state("tab_1");
+    let bar = state.hits.tab_bar;
+    let first = state.hits.tabs[0].0;
+    assert!(bar.width > 0);
+    let gap = first.right();
+    assert!(!state
+        .hits
+        .tabs
+        .iter()
+        .any(|(rect, _)| rect.x <= gap && gap < rect.right()));
+    wheel_at(&mut state, MouseEventKind::ScrollRight, gap, bar.y);
+    assert!(state.tab_swipe.is_some(), "gap between tabs swipes");
+
+    let mut state = three_tab_state("tab_1");
+    let empty = state.hits.new_tab.right() + 3;
+    assert!(empty < bar.right());
+    wheel_at(&mut state, MouseEventKind::ScrollRight, empty, bar.y);
+    assert!(state.tab_swipe.is_some(), "empty space on the row swipes");
+}
+
+#[test]
+fn extra_rows_accept_horizontal_swipes_but_leave_vertical_scroll_to_the_pane() {
+    let mut state = three_tab_state("tab_1");
+    let below = state.hits.tab_bar.bottom();
+    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below);
+    assert!(state.tab_swipe.is_none(), "no extra rows by default");
+
+    let with_extra_rows = || {
+        let mut config = Config::default();
+        config.ui.tab_swipe_extra_rows = 2;
+        three_tab_state_with_config("tab_1", config)
+    };
+    let mut state = with_extra_rows();
+    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below + 1);
+    assert!(state.tab_swipe.is_some(), "second extra row swipes");
+    let mut state = with_extra_rows();
+    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below + 2);
+    assert!(
+        state.tab_swipe.is_none(),
+        "third row is outside the extra rows"
+    );
+    let mut state = with_extra_rows();
+    wheel_at(&mut state, MouseEventKind::ScrollDown, 40, below);
+    assert!(
+        state.tab_swipe.is_none(),
+        "vertical wheel in the extra rows is not a swipe"
+    );
+}

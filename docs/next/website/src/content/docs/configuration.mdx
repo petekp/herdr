@@ -304,6 +304,8 @@ The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
 
+A horizontal trackpad swipe or mouse wheel anywhere on the tab row switches tabs. The focused tab's highlight slides toward the neighbor as you swipe and snaps back if you stop short; past either end it wraps to the other end. Set `tab_swipe_extra_rows` under `[ui]` to also accept horizontal swipes in that many pane rows next to the tab row. Vertical scrolling in those rows still goes to the pane.
+
 Configure an ordered tmux-style status area at the right edge of the tab row:
 
 ```toml

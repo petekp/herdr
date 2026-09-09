@@ -99,6 +99,7 @@ pub(crate) struct ClientShellConfig {
     pub(super) confirm_close: bool,
     pub(super) mouse_capture: bool,
     pub(super) mouse_scroll_lines: usize,
+    pub(super) tab_swipe_extra_rows: u16,
     pub(super) right_click_passthrough_modifiers: Option<crossterm::event::KeyModifiers>,
     pub(super) redraw_on_focus_gained: bool,
     pub(super) switch_ascii_input_source_in_prefix: bool,
@@ -161,6 +162,8 @@ pub(super) struct ShellHitMap {
     pub(super) sidebar_toggle: Rect,
     pub(super) new_workspace: Rect,
     pub(super) new_tab: Rect,
+    /// The whole tab row, including gaps and empty space.
+    pub(super) tab_bar: Rect,
     pub(super) tab_scroll_left: Rect,
     pub(super) tab_scroll_right: Rect,
     pub(super) mobile_switch: Rect,
@@ -910,6 +913,7 @@ pub(crate) struct ClientShellState {
     pub(super) chrome_drag: Option<ClientChromeDrag>,
     pub(super) workspace_press: Option<ClientWorkspacePress>,
     pub(super) tab_press: Option<ClientTabPress>,
+    pub(super) tab_swipe: Option<tab_swipe::TabSwipe>,
     pub(super) collapsed_groups: HashSet<String>,
     pub(super) remote_collapsed_groups: HashMap<ClientEndpointId, HashSet<String>>,
     pub(super) workspace_scroll: usize,
@@ -1065,6 +1069,7 @@ impl ClientShellState {
             chrome_drag: None,
             workspace_press: None,
             tab_press: None,
+            tab_swipe: None,
             collapsed_groups: preferences.collapsed_groups.into_iter().collect(),
             remote_collapsed_groups,
             workspace_scroll: 0,
@@ -1246,6 +1251,7 @@ impl ClientShellState {
         self.chrome_drag = None;
         self.workspace_press = None;
         self.tab_press = None;
+        self.tab_swipe = None;
         self.workspace_scroll = 0;
         self.agent_scroll = 0;
         self.tab_scroll = 0;
@@ -1413,6 +1419,19 @@ impl ClientShellState {
             != snapshot.focused_workspace_id.as_deref()
         {
             self.reveal_focused_workspace = true;
+        }
+        if self.tab_swipe.as_ref().is_some_and(|swipe| {
+            snapshot.focused_workspace_id.as_deref() != Some(swipe.workspace_id.as_str())
+                || !snapshot
+                    .tabs
+                    .iter()
+                    .any(|tab| tab.tab_id == swipe.origin_tab_id)
+                || swipe
+                    .target_tab_id
+                    .as_ref()
+                    .is_some_and(|target| !snapshot.tabs.iter().any(|tab| tab.tab_id == *target))
+        }) {
+            self.tab_swipe = None;
         }
         if tab_layout_changed
             || self
@@ -1665,6 +1684,7 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
+            self.tab_swipe = None;
             if self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
                 gesture.hit.popup && previous_popup.as_deref() == Some(gesture.hit.pane_id.as_str())
             }) {
@@ -1820,9 +1840,31 @@ impl ClientShellState {
 
     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {
         let default = std::time::Duration::from_millis(100);
-        self.selection_autoscroll_deadline
+        let delay = self
+            .selection_autoscroll_deadline
             .map(|deadline| deadline.saturating_duration_since(now).min(default))
-            .unwrap_or(default)
+            .unwrap_or(default);
+        self.tab_swipe
+            .as_ref()
+            .map(|swipe| {
+                swipe
+                    .next_wake(now)
+                    .saturating_duration_since(now)
+                    .min(delay)
+            })
+            .unwrap_or(delay)
+    }
+
+    pub(crate) fn tick_tab_swipe(&mut self, now: std::time::Instant) -> bool {
+        let Some(swipe) = self.tab_swipe.as_mut() else {
+            return false;
+        };
+        let tick = swipe.tick(now);
+        if tick.finished {
+            self.tab_swipe = None;
+            return true;
+        }
+        tick.repaint
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {

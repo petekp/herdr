@@ -31,6 +31,7 @@ mod scroll;
 mod settings;
 mod state;
 mod surface_patch;
+mod tab_swipe;
 mod worktrees;
 
 pub(in crate::client::shell) use render::sidebar;
