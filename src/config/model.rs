@@ -924,9 +924,6 @@ pub struct UiConfig {
     pub redraw_on_focus_gained: bool,
     /// Lines to scroll per mouse wheel notch. Default: 3.
     pub mouse_scroll_lines: Option<NonZeroUsize>,
-    /// Extra rows beside the tab row, toward the panes, where a horizontal
-    /// wheel swipe still switches tabs. Default: 0.
-    pub tab_swipe_extra_rows: u16,
     /// Ask for confirmation before closing a workspace. Default: true.
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
@@ -1173,7 +1170,6 @@ impl Default for UiConfig {
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
             mouse_scroll_lines: None,
-            tab_swipe_extra_rows: 0,
             confirm_close: true,
             prompt_new_tab_name: true,
             prompt_new_workspace_name: false,
@@ -1818,13 +1814,6 @@ mouse_scroll_lines = 1
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.ui.mouse_scroll_lines(), 1);
-    }
-
-    #[test]
-    fn tab_swipe_extra_rows_defaults_to_zero_and_parses() {
-        assert_eq!(Config::default().ui.tab_swipe_extra_rows, 0);
-        let config: Config = toml::from_str("[ui]\ntab_swipe_extra_rows = 2\n").unwrap();
-        assert_eq!(config.ui.tab_swipe_extra_rows, 2);
     }
 
     #[test]

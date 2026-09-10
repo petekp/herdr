@@ -386,10 +386,13 @@ fn close_confirmation_error_becomes_client_owned_overlay_and_stable_group_close(
 }
 
 fn three_tab_state(focused: &str) -> ClientShellState {
-    three_tab_state_with_config(focused, Config::default())
+    three_tab_state_with(focused, |_| {})
 }
 
-fn three_tab_state_with_config(focused: &str, config: Config) -> ClientShellState {
+fn three_tab_state_with(
+    focused: &str,
+    edit: impl FnOnce(&mut ClientShellSnapshot),
+) -> ClientShellState {
     let mut snapshot = snapshot();
     snapshot.tabs.extend((2..=3).map(|number| ClientShellTab {
         tab_id: format!("tab_{number}"),
@@ -405,10 +408,44 @@ fn three_tab_state_with_config(focused: &str, config: Config) -> ClientShellStat
     for tab in &mut snapshot.tabs {
         tab.focused = tab.tab_id == focused;
     }
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    edit(&mut snapshot);
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("three tab bar");
+    state
+}
+
+/// Eight tabs in an 80-column strip, scrolled so tab 4 is the first visible
+/// tab and its previous neighbor, tab 3, is hidden.
+fn eight_tab_state_scrolled_past_tab_3() -> ClientShellState {
+    let mut snapshot = snapshot();
+    snapshot.tabs.extend((2..=8).map(|number| ClientShellTab {
+        tab_id: format!("tab_{number}"),
+        workspace_id: "ws_1".into(),
+        number,
+        label: number.to_string(),
+        custom_label: false,
+        zoomed: false,
+        focused: false,
+        agent_status: AgentStatus::Idle,
+    }));
+    snapshot.focused_tab_id = Some("tab_4".into());
+    for tab in &mut snapshot.tabs {
+        tab.focused = tab.tab_id == "tab_4";
+    }
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot));
+    state.set_pane_surface(surface());
+    state.compose(80, 20).expect("overflow tab bar");
+    state.tab_scroll = 3;
+    state.reveal_focused_tab = false;
+    state.compose(80, 20).expect("scrolled tab bar");
+    assert!(state.hits.tab_scroll_left.width > 0, "strip overflows");
+    assert!(
+        !state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_3"),
+        "previous tab is out of view"
+    );
     state
 }
 
@@ -516,34 +553,7 @@ fn wrapping_swipe_drains_the_origin_and_fills_the_far_tab_from_its_edge() {
 #[test]
 fn swipe_toward_a_neighbor_scrolled_out_of_view_drains_the_origin_toward_that_edge() {
     let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
-    let mut snapshot = snapshot();
-    snapshot.tabs.extend((2..=8).map(|number| ClientShellTab {
-        tab_id: format!("tab_{number}"),
-        workspace_id: "ws_1".into(),
-        number,
-        label: number.to_string(),
-        custom_label: false,
-        zoomed: false,
-        focused: false,
-        agent_status: AgentStatus::Idle,
-    }));
-    snapshot.focused_tab_id = Some("tab_4".into());
-    for tab in &mut snapshot.tabs {
-        tab.focused = tab.tab_id == "tab_4";
-    }
-    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
-    state.set_snapshot(Box::new(snapshot));
-    state.set_pane_surface(surface());
-    state.compose(80, 20).expect("overflow tab bar");
-    // Scroll the strip so tab 4 is the first visible tab and tab 3 is hidden.
-    state.tab_scroll = 3;
-    state.reveal_focused_tab = false;
-    state.compose(80, 20).expect("scrolled tab bar");
-    assert!(state.hits.tab_scroll_left.width > 0, "strip overflows");
-    assert!(
-        !state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_3"),
-        "previous tab is out of view"
-    );
+    let mut state = eight_tab_state_scrolled_past_tab_3();
     let origin = state
         .hits
         .tabs
@@ -654,30 +664,55 @@ fn the_whole_tab_row_is_swipeable_including_gaps_and_empty_space() {
 }
 
 #[test]
-fn extra_rows_accept_horizontal_swipes_but_leave_vertical_scroll_to_the_pane() {
-    let mut state = three_tab_state("tab_1");
-    let below = state.hits.tab_bar.bottom();
-    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below);
-    assert!(state.tab_swipe.is_none(), "no extra rows by default");
+fn a_reveal_requested_while_the_fill_slides_waits_until_it_lands() {
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let settle = crate::client::shell::tab_swipe::TAB_SWIPE_SETTLE;
+    let mut state = eight_tab_state_scrolled_past_tab_3();
+    let commit = wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold);
+    assert_eq!(focused_tab_request(&commit).as_deref(), Some("tab_3"));
 
-    let with_extra_rows = || {
-        let mut config = Config::default();
-        config.ui.tab_swipe_extra_rows = 2;
-        three_tab_state_with_config("tab_1", config)
-    };
-    let mut state = with_extra_rows();
-    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below + 1);
-    assert!(state.tab_swipe.is_some(), "second extra row swipes");
-    let mut state = with_extra_rows();
-    wheel_at(&mut state, MouseEventKind::ScrollRight, 40, below + 2);
+    // The server switches focus while the fill is still landing.
+    let mut update = state.snapshot.as_deref().expect("snapshot").clone();
+    update.focused_tab_id = Some("tab_3".into());
+    for tab in &mut update.tabs {
+        tab.focused = tab.tab_id == "tab_3";
+    }
+    state.set_snapshot(Box::new(update));
+    assert!(state.reveal_focused_tab);
+    let landing = std::time::Instant::now() + settle / 2;
+    state.tick_tab_swipe(landing);
+    state.compose(80, 20).expect("landing tab bar");
     assert!(
-        state.tab_swipe.is_none(),
-        "third row is outside the extra rows"
+        !state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_3"),
+        "strip scrolled under the sliding fill"
     );
-    let mut state = with_extra_rows();
-    wheel_at(&mut state, MouseEventKind::ScrollDown, 40, below);
+    assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_4"));
+
+    state.tick_tab_swipe(landing + settle);
+    state.compose(80, 20).expect("landed tab bar");
     assert!(
-        state.tab_swipe.is_none(),
-        "vertical wheel in the extra rows is not a swipe"
+        state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_3"),
+        "landed fill reveals the new tab"
     );
+}
+
+#[test]
+fn swipe_edge_glyphs_leave_wide_characters_in_labels_intact() {
+    let mut state = three_tab_state_with("tab_1", |snapshot| {
+        snapshot.tabs[0].label = "日本".into();
+        snapshot.tabs[0].custom_label = true;
+    });
+    let origin = state.hits.tabs[0].0;
+    for _ in 0..crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD - 1 {
+        wheel_over_tab(&mut state, MouseEventKind::ScrollRight, 1);
+        let frame = state.compose(106, 20).expect("mid-swipe tab bar");
+        let buffer = frame.to_ratatui_buffer().expect("frame buffer");
+        let row = (origin.x..origin.right())
+            .map(|x| buffer.cell((x, origin.y)).expect("tab cell").symbol())
+            .collect::<String>();
+        assert!(
+            row.contains('日') && row.contains('本'),
+            "wide glyph lost mid-swipe: {row:?}"
+        );
+    }
 }

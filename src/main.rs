@@ -274,11 +274,6 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Pane scrollback lines to scroll per mouse wheel notch.
 # mouse_scroll_lines = 3
 
-# Extra rows next to the tab row, toward the panes, where a horizontal
-# trackpad swipe still switches tabs. Vertical scrolling in those rows
-# keeps going to the pane.
-# tab_swipe_extra_rows = 0
-
 # Ask for confirmation before closing a workspace
 # confirm_close = true
 
