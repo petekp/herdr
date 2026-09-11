@@ -5,6 +5,11 @@ use std::time::{Duration, Instant};
 /// swipe on macOS delivers roughly 150 events, so this commits about a third
 /// of the way through a normal swipe.
 pub(super) const TAB_SWIPE_THRESHOLD: u32 = 48;
+/// Weighted events a swipe accumulates before the fill starts to move, like
+/// the minimum distance before a touch pan gesture begins. A few stray
+/// sideways events during a vertical scroll never show; a real swipe loses
+/// nothing visible.
+pub(super) const TAB_SWIPE_DEAD_ZONE: u32 = 8;
 /// Quiet time after which an unfinished swipe snaps back, and the fallback
 /// after which a finished swipe stops swallowing the tail of its burst.
 pub(super) const TAB_SWIPE_IDLE: Duration = Duration::from_millis(220);
@@ -18,9 +23,10 @@ const FAST_GAP: Duration = Duration::from_millis(20);
 /// enough: a busy client can read two wheel notches in one batch.
 const TRACKPAD_FAST_EVENTS: u32 = 2;
 /// Gap at or above which an event counts as a discrete notch. Gaps between
-/// the two limits are ambiguous, a fast wheel flick or a moderate trackpad
-/// swipe, and weigh 1 so the rarer failure is a switch that needs more input.
-const SPARSE_GAP: Duration = Duration::from_millis(40);
+/// `FAST_GAP` and this are ambiguous, a fast wheel flick or a moderate
+/// trackpad swipe, and weigh 1 so the rarer failure is a switch that needs
+/// more input.
+const SPARSE_GAP: Duration = super::wheel_axis::WHEEL_NOTCH_GAP;
 /// Weight of a discrete notch, so a mouse wheel switches in a handful of clicks.
 const SPARSE_EVENT_WEIGHT: i32 = 8;
 /// A committed swipe ignores input this long so the burst that committed it
@@ -43,6 +49,7 @@ pub(super) struct TabSwipe {
     /// Neighbor the fill is moving toward. `None` while the swipe is at rest.
     pub(super) target: Option<TabSwipeTarget>,
     /// How far the fill has moved from the origin toward the target, 0 to 1.
+    /// Stays at 0 inside the dead zone.
     pub(super) progress: f32,
     /// Net weighted wheel events so far. Positive moves toward the next tab.
     steps: i32,
@@ -199,7 +206,7 @@ impl TabSwipe {
             TabSwipePhase::SnappingBack { .. } => {
                 // Resume from wherever the snap-back animation currently is.
                 let sign = if self.steps < 0 { -1 } else { 1 };
-                self.steps = (self.progress * TAB_SWIPE_THRESHOLD as f32).round() as i32 * sign;
+                self.steps = Self::steps_for_progress(self.progress) as i32 * sign;
                 self.phase = TabSwipePhase::Tracking;
             }
             TabSwipePhase::Landing { commit, .. } | TabSwipePhase::Cooldown { commit } => {
@@ -231,7 +238,7 @@ impl TabSwipe {
         });
         let magnitude = steps.unsigned_abs();
         if magnitude < TAB_SWIPE_THRESHOLD {
-            self.progress = magnitude as f32 / TAB_SWIPE_THRESHOLD as f32;
+            self.progress = Self::progress_for_steps(magnitude);
             return TabSwipePush::Continue;
         }
         // Steps only move toward a neighbor that exists, so a threshold-sized
@@ -248,6 +255,22 @@ impl TabSwipe {
             },
         };
         TabSwipePush::Commit(target.tab_id.clone())
+    }
+
+    /// Fill position for a step count: nothing inside the dead zone, then a
+    /// straight line from 0 at its edge to 1 at the threshold.
+    fn progress_for_steps(magnitude: u32) -> f32 {
+        magnitude.saturating_sub(TAB_SWIPE_DEAD_ZONE) as f32
+            / (TAB_SWIPE_THRESHOLD - TAB_SWIPE_DEAD_ZONE) as f32
+    }
+
+    /// Inverse of `progress_for_steps` for resuming a snap-back.
+    fn steps_for_progress(progress: f32) -> u32 {
+        if progress <= 0.0 {
+            return 0;
+        }
+        TAB_SWIPE_DEAD_ZONE
+            + (progress * (TAB_SWIPE_THRESHOLD - TAB_SWIPE_DEAD_ZONE) as f32).round() as u32
     }
 
     /// Records the event's time for the rate test. Events read from the
@@ -428,22 +451,36 @@ mod tests {
     }
 
     #[test]
-    fn progress_tracks_the_event_count() {
+    fn progress_tracks_the_event_count_past_the_dead_zone() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD / 4, now);
-        assert!((swipe.progress - 0.25).abs() < 1e-6);
+        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_DEAD_ZONE, now);
+        assert_eq!(swipe.progress, 0.0, "the dead zone draws nothing");
         assert_eq!(target_id(&swipe), Some("tab_next"));
+        let quarter = (TAB_SWIPE_THRESHOLD - TAB_SWIPE_DEAD_ZONE) / 4;
+        trackpad(&mut swipe, 1, quarter, at);
+        assert!((swipe.progress - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_few_stray_events_finish_quietly_when_idle() {
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        let (at, _) = trackpad(&mut swipe, 1, 3, now);
+        assert_eq!(swipe.progress, 0.0);
+        let tick = swipe.tick(at + TAB_SWIPE_IDLE);
+        assert!(tick.finished && !tick.repaint, "no snap-back to animate");
     }
 
     #[test]
     fn reversing_direction_moves_the_fill_back_toward_the_origin() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, 2, now);
+        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_DEAD_ZONE + 2, now);
+        let before = swipe.progress;
         let (at, _) = trackpad(&mut swipe, -1, 1, at);
-        assert!((swipe.progress - 1.0 / TAB_SWIPE_THRESHOLD as f32).abs() < 1e-6);
-        trackpad(&mut swipe, -1, 2, at);
+        assert!(swipe.progress > 0.0 && swipe.progress < before);
+        trackpad(&mut swipe, -1, TAB_SWIPE_DEAD_ZONE + 3, at);
         assert_eq!(target_id(&swipe), Some("tab_prev"));
     }
 

@@ -226,14 +226,14 @@ fn disabled_mouse_chrome_keeps_tab_wheel_but_removes_split_drag_hits() {
             })
             .collect(),
     );
-    assert!(matches!(
-        &wheel.actions[..],
-        [ClientShellAction::Endpoint { request, .. }]
+    assert!(wheel.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
             if matches!(
                 &request.method,
                 crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
             )
-    ));
+    )));
 }
 
 #[test]

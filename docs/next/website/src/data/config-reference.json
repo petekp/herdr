@@ -1004,6 +1004,16 @@
           ]
         },
         {
+          "key": "ui.tab_swipe_transition",
+          "type": "enum",
+          "default": "\"slide\"",
+          "description": "How the pane area changes during a tab swipe: the content slides sideways or dissolves cell by cell.",
+          "values": [
+            "slide",
+            "dissolve"
+          ]
+        },
+        {
           "key": "ui.tab_bar_right",
           "type": "array",
           "default": "[]",

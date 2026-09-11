@@ -3,6 +3,9 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
+/// Agents that report the mouse but never act on horizontal wheel.
+const AGENTS_DROPPING_HORIZONTAL_WHEEL: &[&str] = &["claude"];
+
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
@@ -404,6 +407,49 @@ impl ClientShellState {
         ((pointer + grab_offset - origin) as f32 / f32::from(length.max(1))).clamp(0.1, 0.9)
     }
 
+    /// Whether a wheel event at `point` drives the tab swipe: any wheel on the
+    /// tab row, or a horizontal wheel over a pane whose app would drop it.
+    fn wheel_swipes_tabs(&self, kind: MouseEventKind, point: (u16, u16)) -> bool {
+        if super::contains(self.hits.tab_bar, point) {
+            return true;
+        }
+        matches!(
+            kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) && self.hits.panes.iter().any(|hit| {
+            super::contains(hit.inner_rect, point) && self.pane_drops_horizontal_wheel(hit)
+        })
+    }
+
+    /// Whether the pane's app would ignore a horizontal wheel event, so Herdr
+    /// can spend it on the tab swipe. An app that is not reporting the mouse
+    /// never sees wheel events, and Claude Code's fullscreen renderer tracks
+    /// the mouse only to scroll its own transcript.
+    fn pane_drops_horizontal_wheel(&self, hit: &PaneHit) -> bool {
+        if !hit.mouse_reporting {
+            return true;
+        }
+        self.snapshot.as_deref().is_some_and(|snapshot| {
+            snapshot.agents.iter().any(|agent| {
+                agent.pane_id == hit.pane_id
+                    && agent
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| AGENTS_DROPPING_HORIZONTAL_WHEEL.contains(&agent))
+            })
+        })
+    }
+
+    /// Whether a wheel event is on the axis its burst started on. Applied
+    /// wherever Herdr spends horizontal wheel on the swipe; other apps that
+    /// report the mouse get every event.
+    fn admit_wheel_axis(&mut self, kind: MouseEventKind, now: std::time::Instant) -> bool {
+        match super::wheel_axis::WheelAxis::of(kind) {
+            Some(axis) => super::wheel_axis::WheelAxisLock::admit(&mut self.wheel_axis, axis, now),
+            None => true,
+        }
+    }
+
     /// Feeds one wheel event over the tab strip into the swipe gesture.
     fn push_tab_swipe(
         &mut self,
@@ -442,9 +488,15 @@ impl ClientShellState {
                 super::tab_swipe::TabSwipe::begin(workspace_id.clone(), origin_id, now)
             });
             let before = swipe.progress;
-            match swipe.push(delta, neighbors, now) {
+            let push = swipe.push(delta, neighbors, now);
+            let moved = swipe.progress != before;
+            let target = swipe.target.as_ref().map(|target| target.tab_id.clone());
+            match push {
                 super::tab_swipe::TabSwipePush::Continue => {
-                    outcome.repaint |= swipe.progress != before;
+                    outcome.repaint |= moved;
+                    if let Some(target) = target {
+                        self.request_neighbor_surface(&target, outcome);
+                    }
                     return;
                 }
                 super::tab_swipe::TabSwipePush::Commit(tab_id) => {
@@ -460,7 +512,7 @@ impl ClientShellState {
                 super::tab_swipe::TabSwipePush::Restart => {
                     // The new swipe starts from the tab the last one switched to,
                     // even if the snapshot has not caught up yet.
-                    origin = swipe.target.as_ref().map(|target| target.tab_id.clone());
+                    origin = target;
                     self.tab_swipe = None;
                     outcome.repaint = true;
                 }
@@ -1836,8 +1888,11 @@ impl ClientShellState {
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight
-                if super::contains(self.hits.tab_bar, point) =>
+                if self.wheel_swipes_tabs(mouse.kind, point) =>
             {
+                if !self.admit_wheel_axis(mouse.kind, now) {
+                    return;
+                }
                 let delta = match mouse.kind {
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => -1,
                     _ => 1,
@@ -2270,6 +2325,11 @@ impl ClientShellState {
                     .find(|hit| super::contains(hit.inner_rect, point))
                     .cloned()
                 {
+                    if self.pane_drops_horizontal_wheel(&hit)
+                        && !self.admit_wheel_axis(mouse.kind, now)
+                    {
+                        return;
+                    }
                     if self.focused_pane_id().as_deref() != Some(hit.pane_id.as_str()) {
                         self.push_endpoint_method(
                             crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {

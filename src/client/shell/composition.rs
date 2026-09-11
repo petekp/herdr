@@ -292,7 +292,28 @@ impl ClientShellState {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
-        blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+        let sliding = match self.tab_slide(&surface.frame, layout.pane_surface) {
+            Some(slide) => {
+                match self.config.tab_swipe_transition {
+                    TabSwipeTransitionConfig::Slide => super::tab_slide::compose_tab_slide(
+                        &mut frame,
+                        layout.pane_surface,
+                        slide,
+                        &self.config.palette,
+                    ),
+                    TabSwipeTransitionConfig::Dissolve => super::tab_slide::compose_tab_dissolve(
+                        &mut frame,
+                        layout.pane_surface,
+                        slide,
+                    ),
+                }
+                true
+            }
+            None => {
+                blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+                false
+            }
+        };
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         let has_selection = self
             .selection
@@ -302,7 +323,7 @@ impl ClientShellState {
             .copy_mode
             .as_ref()
             .is_some_and(|copy_mode| !copy_mode.search_matches.is_empty());
-        if has_selection || has_search {
+        if (has_selection || has_search) && !sliding {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
             for hit in &self.hits.panes {
@@ -348,7 +369,7 @@ impl ClientShellState {
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
-        if self.mode == ClientShellMode::Copy {
+        if self.mode == ClientShellMode::Copy && !sliding {
             frame.cursor = None;
             if let Some(copy_mode) = self.copy_mode.as_ref() {
                 if let Some(hit) = self.hits.panes.iter().find(|hit| {
