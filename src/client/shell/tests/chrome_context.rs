@@ -929,12 +929,15 @@ fn neighbor_surface_result(
         tab_id: tab_id.into(),
         cols: area.width,
         rows: area.height,
-        lines: vec![vec![crate::api::schema::ClientShellSurfaceRun {
-            cells: vec![symbol.to_owned(); usize::from(area.width)],
-            fg: 0,
-            bg: 0,
-            modifier: 0,
-        }]],
+        lines: vec![
+            vec![crate::api::schema::ClientShellSurfaceRun {
+                cells: vec![symbol.to_owned(); usize::from(area.width)],
+                fg: 0,
+                bg: 0,
+                modifier: 0,
+            }];
+            usize::from(area.height)
+        ],
     }
 }
 
@@ -1099,6 +1102,41 @@ fn a_landed_swipe_shows_the_neighbor_surface_until_its_tab_arrives() {
         frame.cursor.is_some(),
         "the landed tab shows its cursor again"
     );
+}
+
+#[test]
+fn a_staggered_slide_moves_the_top_row_ahead_of_the_bottom_row() {
+    let dead_zone = crate::client::shell::tab_swipe::TAB_SWIPE_DEAD_ZONE;
+    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
+    let mut state = three_tab_state("tab_1");
+    state.config.tab_swipe_transition = TabSwipeTransitionConfig::StaggeredSlide;
+    let area = state.layout(106, 20).pane_surface;
+    let start = std::time::Instant::now();
+    let first = dense_swipe(&mut state, MouseEventKind::ScrollRight, 1, start);
+    state.handle_endpoint_result(
+        "boot-1",
+        &endpoint_request_id(&first),
+        Ok(neighbor_surface_result("tab_2", area, "N")),
+    );
+    let half = (threshold - dead_zone) / 2;
+    dense_swipe(
+        &mut state,
+        MouseEventKind::ScrollRight,
+        dead_zone - 1 + half,
+        start + std::time::Duration::from_millis(5),
+    );
+
+    let frame = state.compose(106, 20).expect("sliding frame");
+    assert!(frame.cursor.is_none());
+    let arrived = |row: u16| {
+        (area.x..area.right())
+            .filter(|&column| frame_symbol(&frame, column, row) == "N")
+            .count()
+    };
+    let top = arrived(area.y);
+    let bottom = arrived(area.bottom() - 1);
+    assert!(top > bottom, "top {top} columns, bottom {bottom} columns");
+    assert!(bottom < usize::from(area.width));
 }
 
 #[test]

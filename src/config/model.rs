@@ -850,6 +850,7 @@ pub enum TabBarPositionConfig {
 pub enum TabSwipeTransitionConfig {
     #[default]
     Slide,
+    StaggeredSlide,
     Dissolve,
 }
 

@@ -311,7 +311,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Desktop tab row placement: "top" or "bottom".
 # tab_bar_position = "top"
 
-# How the pane area changes during a tab swipe: "slide" or "dissolve".
+# How the pane area changes during a tab swipe: "slide", "staggered_slide", or "dissolve".
 # tab_swipe_transition = "slide"
 
 # Ordered status entries at the right edge of the desktop tab bar.
