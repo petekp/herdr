@@ -214,20 +214,26 @@ fn disabled_mouse_chrome_keeps_tab_wheel_but_removes_split_drag_hits() {
     state.compose(106, 20).expect("mouse-disabled shell");
     assert!(state.hits.pane_splits.is_empty());
     let first_tab = state.hits.tabs[0].0;
-    let wheel = state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-        kind: MouseEventKind::ScrollDown,
-        column: first_tab.x,
-        row: first_tab.y,
-        modifiers: KeyModifiers::empty(),
-    })]);
-    assert!(matches!(
-        &wheel.actions[..],
-        [ClientShellAction::Endpoint { request, .. }]
+    let wheel = state.handle_raw_events(
+        (0..crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD)
+            .map(|_| {
+                RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: first_tab.x,
+                    row: first_tab.y,
+                    modifiers: KeyModifiers::empty(),
+                })
+            })
+            .collect(),
+    );
+    assert!(wheel.actions.iter().any(|action| matches!(
+        action,
+        ClientShellAction::Endpoint { request, .. }
             if matches!(
                 &request.method,
                 crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_2"
             )
-    ));
+    )));
 }
 
 #[test]
@@ -730,28 +736,26 @@ fn tab_drag_clears_its_drop_target_after_leaving_the_tab_row() {
 }
 
 #[test]
-fn tab_wheel_switches_tabs_without_changing_overflow_scroll() {
+fn tab_wheel_does_not_wrap_a_single_tab_or_change_overflow_scroll() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     state.set_snapshot(Box::new(snapshot()));
     state.set_pane_surface(surface());
     state.compose(106, 20).expect("tab bar");
     let tab = state.hits.tabs[0].0;
 
-    let outcome =
-        state.handle_raw_events(vec![RawInputEvent::Mouse(crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: tab.x,
-            row: tab.y,
-            modifiers: KeyModifiers::empty(),
-        })]);
-    assert!(matches!(
-        &outcome.actions[..],
-        [ClientShellAction::Endpoint { request, .. }]
-            if matches!(
-                &request.method,
-                crate::api::schema::Method::TabFocus(target) if target.tab_id == "tab_1"
-            )
-    ));
+    let outcome = state.handle_raw_events(
+        (0..crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD * 2)
+            .map(|_| {
+                RawInputEvent::Mouse(crossterm::event::MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: tab.x,
+                    row: tab.y,
+                    modifiers: KeyModifiers::empty(),
+                })
+            })
+            .collect(),
+    );
+    assert!(outcome.actions.is_empty());
     assert_eq!(state.tab_scroll, 0);
     state.compose(106, 20).expect("tab bar after wheel");
     assert!(state.hits.tabs.iter().any(|(_, tab_id)| tab_id == "tab_1"));

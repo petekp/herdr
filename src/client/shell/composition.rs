@@ -59,6 +59,7 @@ impl ClientShellState {
                 sidebar_collapsed: false,
                 sidebar_section_split: self.sidebar_section_split,
                 tab_drag_insert_index: None,
+                tab_swipe: None,
                 selected_workspace_id: self
                     .navigate_workspace_id
                     .as_ref()
@@ -171,6 +172,7 @@ impl ClientShellState {
                 sidebar_collapsed: self.sidebar_collapsed,
                 sidebar_section_split: self.sidebar_section_split,
                 tab_drag_insert_index,
+                tab_swipe: self.tab_swipe.as_ref(),
                 selected_workspace_id: self
                     .navigate_workspace_id
                     .as_ref()
@@ -277,8 +279,10 @@ impl ClientShellState {
                 &self.config.palette,
             )
         };
+        self.hits.tab_bar = layout.tab_bar;
         if mode_bar == Some(layout.tab_bar) {
             self.hits.tabs.clear();
+            self.hits.tab_bar = Rect::default();
             self.hits.new_tab = Rect::default();
             self.hits.tab_scroll_left = Rect::default();
             self.hits.tab_scroll_right = Rect::default();
@@ -288,7 +292,38 @@ impl ClientShellState {
             let start = usize::from(bar.y) * usize::from(frame.width) + usize::from(bar.x);
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
-        blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+        let sliding = match self.tab_slide(&surface.frame, layout.pane_surface) {
+            Some(slide) => {
+                match self.config.tab_swipe_transition {
+                    TabSwipeTransitionConfig::Slide => super::tab_slide::compose_tab_slide(
+                        &mut frame,
+                        layout.pane_surface,
+                        slide,
+                        &self.config.palette,
+                        0.0,
+                    ),
+                    TabSwipeTransitionConfig::StaggeredSlide => {
+                        super::tab_slide::compose_tab_slide(
+                            &mut frame,
+                            layout.pane_surface,
+                            slide,
+                            &self.config.palette,
+                            super::tab_slide::TAB_SLIDE_ROW_STAGGER,
+                        )
+                    }
+                    TabSwipeTransitionConfig::Dissolve => super::tab_slide::compose_tab_dissolve(
+                        &mut frame,
+                        layout.pane_surface,
+                        slide,
+                    ),
+                }
+                true
+            }
+            None => {
+                blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+                false
+            }
+        };
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         let has_selection = self
             .selection
@@ -298,7 +333,7 @@ impl ClientShellState {
             .copy_mode
             .as_ref()
             .is_some_and(|copy_mode| !copy_mode.search_matches.is_empty());
-        if has_selection || has_search {
+        if (has_selection || has_search) && !sliding {
             let cursor = frame.cursor.clone();
             let mut composed = frame.to_ratatui_buffer()?;
             for hit in &self.hits.panes {
@@ -344,7 +379,7 @@ impl ClientShellState {
             }
             frame.replace_from_ratatui_buffer_preserving_effects(&composed, cursor);
         }
-        if self.mode == ClientShellMode::Copy {
+        if self.mode == ClientShellMode::Copy && !sliding {
             frame.cursor = None;
             if let Some(copy_mode) = self.copy_mode.as_ref() {
                 if let Some(hit) = self.hits.panes.iter().find(|hit| {

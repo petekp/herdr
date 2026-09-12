@@ -6583,3 +6583,106 @@ fn no_handle_internal_event_bypass_in_module() {
         bypass_lines.join("\n  ")
     );
 }
+
+#[tokio::test]
+async fn client_shell_surface_read_renders_another_tab_without_focusing_it() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("surface-read");
+    let first_pane = workspace.tabs[0].root_pane;
+    let second_tab = workspace.test_add_tab(Some("second"));
+    let second_pane = workspace.tabs[second_tab].root_pane;
+    workspace.insert_test_runtime(
+        first_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"FIRST"),
+    );
+    workspace.insert_test_runtime(
+        second_pane,
+        crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 23, b"HELLO FROM TAB TWO"),
+    );
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let second_tab_id = server.app.public_tab_id(0, second_tab).unwrap();
+
+    let (control, _render) = connect_test_shell(&mut server, 7, 100, 30);
+    let _ = control.recv().expect("initial snapshot");
+    let focused_before = server.shell_tab_id_for_client(7);
+    let read_request = |id: &str| {
+        Box::new(api::schema::Request {
+            id: id.into(),
+            method: api::schema::Method::ClientShellSurfaceRead(api::schema::TabTarget {
+                tab_id: second_tab_id.clone(),
+            }),
+        })
+    };
+
+    assert!(
+        !server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id: 7,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: read_request("read-second"),
+        }),
+        "no client shows the second tab, so nothing needs a full render"
+    );
+    let ServerMessage::ClientShellEndpointResponseChunk {
+        request_id,
+        final_chunk,
+        data,
+        ..
+    } = read_server_message(control.recv().expect("surface response"))
+    else {
+        panic!("expected an endpoint response");
+    };
+    assert_eq!(request_id, "read-second");
+    assert!(final_chunk);
+    let response =
+        serde_json::from_slice::<api::schema::SuccessResponse>(&data).expect("success response");
+    let api::schema::ResponseResult::ClientShellSurface {
+        tab_id,
+        cols,
+        rows,
+        lines,
+    } = response.result
+    else {
+        panic!("expected a surface result");
+    };
+    assert_eq!(tab_id, second_tab_id);
+    assert_eq!((cols, rows), (100, 30));
+    assert_eq!(lines.len(), 30);
+    let text = lines
+        .iter()
+        .map(|runs| {
+            runs.iter()
+                .flat_map(|run| run.cells.iter().map(String::as_str))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("HELLO FROM TAB TWO"),
+        "the second tab's content is rendered: {text}"
+    );
+    assert_eq!(server.shell_tab_id_for_client(7), focused_before);
+    assert!(!server.clients[&7].shell_endpoint_command_in_flight);
+
+    // Rendering consumed the dirty rows a client showing that tab patches from,
+    // so that client takes a full frame next.
+    let (other_control, _other_render) = connect_test_shell(&mut server, 8, 100, 30);
+    let _ = other_control.recv().expect("other snapshot");
+    assert!(server.focus_shell_client_on_tab(8, &second_tab_id));
+    server.clients.get_mut(&8).unwrap().clear_deferred_render();
+    assert!(
+        server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
+            client_id: 7,
+            boot_id: server.client_shell_boot_id.clone(),
+            request: read_request("read-again"),
+        })
+    );
+    let _ = control.recv().expect("second surface response");
+    assert!(matches!(
+        server.clients[&8].deferred_render(),
+        crate::server::clients::DeferredRender::Full
+    ));
+    shutdown_test_runtimes(&mut server);
+}

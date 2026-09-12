@@ -844,6 +844,16 @@ pub enum TabBarPositionConfig {
     Bottom,
 }
 
+/// How the pane area changes while a swipe moves between tabs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TabSwipeTransitionConfig {
+    #[default]
+    Slide,
+    StaggeredSlide,
+    Dissolve,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaneBordersConfig {
     #[default]
@@ -948,6 +958,8 @@ pub struct UiConfig {
     pub hide_tab_bar_when_single_tab: bool,
     /// Desktop tab row placement. Default: top.
     pub tab_bar_position: TabBarPositionConfig,
+    /// How the pane area changes during a tab swipe. Default: slide.
+    pub tab_swipe_transition: TabSwipeTransitionConfig,
     /// Ordered entries shown at the right edge of the desktop tab row. Empty by default.
     pub tab_bar_right: Vec<TabBarRightEntryConfig>,
     /// Text inserted between visible right-side tab bar entries. Default: one space.
@@ -1180,6 +1192,7 @@ impl Default for UiConfig {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             tab_bar_position: TabBarPositionConfig::Top,
+            tab_swipe_transition: TabSwipeTransitionConfig::Slide,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
             window_title: super::window_title::default_window_title(),
@@ -1485,6 +1498,10 @@ status_indicators = "symbols"
             default_config.ui.tab_bar_position,
             TabBarPositionConfig::Top
         );
+        assert_eq!(
+            default_config.ui.tab_swipe_transition,
+            TabSwipeTransitionConfig::Slide
+        );
         assert!(default_config.ui.tab_bar_right.is_empty());
         assert_eq!(default_config.ui.tab_bar_right_separator, " ");
 
@@ -1497,6 +1514,7 @@ pane_gaps = true
 show_agent_labels_on_pane_borders = true
 hide_tab_bar_when_single_tab = true
 tab_bar_position = "bottom"
+tab_swipe_transition = "dissolve"
 tab_bar_right = [
   { type = "zoom" },
   { type = "hostname" },
@@ -1514,6 +1532,10 @@ tab_bar_right_separator = " · "
         assert!(config.ui.show_agent_labels_on_pane_borders);
         assert!(config.ui.hide_tab_bar_when_single_tab);
         assert_eq!(config.ui.tab_bar_position, TabBarPositionConfig::Bottom);
+        assert_eq!(
+            config.ui.tab_swipe_transition,
+            TabSwipeTransitionConfig::Dissolve
+        );
         assert_eq!(config.ui.tab_bar_right.len(), 5);
         assert!(matches!(
             config.ui.tab_bar_right[1],

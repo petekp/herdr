@@ -354,11 +354,17 @@ fn handle_request(
         });
     }
 
-    if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
+    if matches!(
+        &request.method,
+        Method::ClientShellSurfaceSet(_) | Method::ClientShellSurfaceRead(_)
+    ) {
         return error_response_json(
             request.id,
             "connection_local_only",
-            "client_shell.surface.set is only available through a client shell endpoint".into(),
+            format!(
+                "{} is only available through a client shell endpoint",
+                api_method_name(&request.method)
+            ),
         );
     }
 
@@ -397,6 +403,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
+        Method::ClientShellSurfaceRead(_) => "client_shell.surface.read",
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",

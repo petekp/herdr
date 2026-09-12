@@ -3,6 +3,9 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
+/// Agents that report the mouse but never act on horizontal wheel.
+const AGENTS_DROPPING_HORIZONTAL_WHEEL: &[&str] = &["claude", "omp"];
+
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
@@ -404,6 +407,119 @@ impl ClientShellState {
         ((pointer + grab_offset - origin) as f32 / f32::from(length.max(1))).clamp(0.1, 0.9)
     }
 
+    /// Whether a wheel event at `point` drives the tab swipe: any wheel on the
+    /// tab row, or a horizontal wheel over a pane whose app would drop it.
+    fn wheel_swipes_tabs(&self, kind: MouseEventKind, point: (u16, u16)) -> bool {
+        if super::contains(self.hits.tab_bar, point) {
+            return true;
+        }
+        matches!(
+            kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) && self.hits.panes.iter().any(|hit| {
+            super::contains(hit.inner_rect, point) && self.pane_drops_horizontal_wheel(hit)
+        })
+    }
+
+    /// Whether the pane's app would ignore a horizontal wheel event, so Herdr
+    /// can spend it on the tab swipe. An app that is not reporting the mouse
+    /// never sees wheel events, and Claude Code's fullscreen renderer tracks
+    /// the mouse only to scroll its own transcript.
+    fn pane_drops_horizontal_wheel(&self, hit: &PaneHit) -> bool {
+        if !hit.mouse_reporting {
+            return true;
+        }
+        self.snapshot.as_deref().is_some_and(|snapshot| {
+            snapshot.agents.iter().any(|agent| {
+                agent.pane_id == hit.pane_id
+                    && agent
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| AGENTS_DROPPING_HORIZONTAL_WHEEL.contains(&agent))
+            })
+        })
+    }
+
+    /// Whether a wheel event is on the axis its burst started on. Applied
+    /// wherever Herdr spends horizontal wheel on the swipe; other apps that
+    /// report the mouse get every event.
+    fn admit_wheel_axis(&mut self, kind: MouseEventKind, now: std::time::Instant) -> bool {
+        match super::wheel_axis::WheelAxis::of(kind) {
+            Some(axis) => super::wheel_axis::WheelAxisLock::admit(&mut self.wheel_axis, axis, now),
+            None => true,
+        }
+    }
+
+    /// Feeds one wheel event over the tab strip into the swipe gesture.
+    fn push_tab_swipe(
+        &mut self,
+        delta: i32,
+        now: std::time::Instant,
+        outcome: &mut ClientShellInput,
+    ) {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return;
+        };
+        let Some(workspace_id) = snapshot.focused_workspace_id.clone() else {
+            return;
+        };
+        let tab_ids = snapshot
+            .tabs
+            .iter()
+            .filter(|tab| tab.workspace_id == workspace_id)
+            .map(|tab| tab.tab_id.clone())
+            .collect::<Vec<_>>();
+        let mut origin = self
+            .tab_swipe
+            .as_ref()
+            .map(|swipe| swipe.origin_tab_id.clone())
+            .or_else(|| snapshot.focused_tab_id.clone());
+        // A restart replays the event into a new gesture, so at most two passes.
+        for _ in 0..2 {
+            let Some(origin_id) = origin.take() else {
+                return;
+            };
+            let Some(origin_index) = tab_ids.iter().position(|tab_id| *tab_id == origin_id) else {
+                self.tab_swipe = None;
+                return;
+            };
+            let neighbors = super::tab_swipe::TabSwipeNeighbors::around(&tab_ids, origin_index);
+            let swipe = self.tab_swipe.get_or_insert_with(|| {
+                super::tab_swipe::TabSwipe::begin(workspace_id.clone(), origin_id, now)
+            });
+            let before = swipe.progress;
+            let push = swipe.push(delta, neighbors, now);
+            let moved = swipe.progress != before;
+            let target = swipe.target.as_ref().map(|target| target.tab_id.clone());
+            match push {
+                super::tab_swipe::TabSwipePush::Continue => {
+                    outcome.repaint |= moved;
+                    if let Some(target) = target {
+                        self.request_neighbor_surface(&target, outcome);
+                    }
+                    return;
+                }
+                super::tab_swipe::TabSwipePush::Commit(tab_id) => {
+                    outcome.repaint = true;
+                    self.push_endpoint_method(
+                        crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+                            tab_id,
+                        }),
+                        outcome,
+                    );
+                    return;
+                }
+                super::tab_swipe::TabSwipePush::Restart => {
+                    // The new swipe starts from the tab the last one switched to,
+                    // even if the snapshot has not caught up yet.
+                    origin = target;
+                    self.tab_swipe = None;
+                    outcome.repaint = true;
+                }
+            }
+        }
+    }
+
     fn tab_drop_index_at(&self, point: (u16, u16)) -> Option<usize> {
         let snapshot = self.snapshot.as_deref()?;
         let workspace_id = snapshot.focused_workspace_id.as_deref()?;
@@ -605,7 +721,13 @@ impl ClientShellState {
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent, outcome: &mut ClientShellInput) {
+    /// `now` is shared by every event in the input batch this one arrived in.
+    pub(super) fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        now: std::time::Instant,
+        outcome: &mut ClientShellInput,
+    ) {
         let point = (mouse.column, mouse.row);
         if self.mode == ClientShellMode::Navigate
             && self.workspace_preview_action_blocked()
@@ -1767,34 +1889,19 @@ impl ClientShellState {
                 }
             }
             MouseEventKind::ScrollUp
-                if self
-                    .hits
-                    .tabs
-                    .iter()
-                    .any(|(rect, _)| super::contains(*rect, point))
-                    || super::contains(self.hits.tab_scroll_left, point)
-                    || super::contains(self.hits.tab_scroll_right, point)
-                    || super::contains(self.hits.new_tab, point) =>
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+                if self.wheel_swipes_tabs(mouse.kind, point) =>
             {
-                self.record_binding(
-                    crate::input::KeybindMatch::Action(crate::input::KeybindAction::PreviousTab),
-                    outcome,
-                );
-            }
-            MouseEventKind::ScrollDown
-                if self
-                    .hits
-                    .tabs
-                    .iter()
-                    .any(|(rect, _)| super::contains(*rect, point))
-                    || super::contains(self.hits.tab_scroll_left, point)
-                    || super::contains(self.hits.tab_scroll_right, point)
-                    || super::contains(self.hits.new_tab, point) =>
-            {
-                self.record_binding(
-                    crate::input::KeybindMatch::Action(crate::input::KeybindAction::NextTab),
-                    outcome,
-                );
+                if !self.admit_wheel_axis(mouse.kind, now) {
+                    return;
+                }
+                let delta = match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => -1,
+                    _ => 1,
+                };
+                self.push_tab_swipe(delta, now, outcome);
             }
             MouseEventKind::ScrollUp if super::contains(self.hits.agent_body, point) => {
                 let next = self.agent_scroll.saturating_sub(1);
@@ -2222,6 +2329,11 @@ impl ClientShellState {
                     .find(|hit| super::contains(hit.inner_rect, point))
                     .cloned()
                 {
+                    if self.pane_drops_horizontal_wheel(&hit)
+                        && !self.admit_wheel_axis(mouse.kind, now)
+                    {
+                        return;
+                    }
                     if self.focused_pane_id().as_deref() != Some(hit.pane_id.as_str()) {
                         self.push_endpoint_method(
                             crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
