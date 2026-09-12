@@ -4,7 +4,7 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// Agents that report the mouse but never act on horizontal wheel.
-const AGENTS_DROPPING_HORIZONTAL_WHEEL: &[&str] = &["claude"];
+const AGENTS_DROPPING_HORIZONTAL_WHEEL: &[&str] = &["claude", "omp"];
 
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
