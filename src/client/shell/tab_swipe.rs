@@ -1,14 +1,15 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Weighted wheel events in one direction needed to switch tabs. A trackpad
-/// swipe on macOS delivers roughly 150 events, so this commits about a third
-/// of the way through a normal swipe.
+use super::wheel_axis::WheelPace;
+
+/// Wheel events in one direction needed to switch tabs. A trackpad swipe on
+/// macOS delivers roughly 150 events, so this commits about a third of the way
+/// through a normal swipe.
 pub(super) const TAB_SWIPE_THRESHOLD: u32 = 48;
-/// Weighted events a swipe accumulates before the fill starts to move, like
-/// the minimum distance before a touch pan gesture begins. A few stray
-/// sideways events during a vertical scroll never show; a real swipe loses
-/// nothing visible.
+/// Events a swipe accumulates before the fill starts to move, like the minimum
+/// distance before a touch pan gesture begins. A few stray sideways events
+/// during a vertical scroll never show; a real swipe loses nothing visible.
 pub(super) const TAB_SWIPE_DEAD_ZONE: u32 = 8;
 /// Quiet time after which an unfinished swipe snaps back, and the fallback
 /// after which a finished swipe stops swallowing the tail of its burst.
@@ -16,19 +17,9 @@ pub(super) const TAB_SWIPE_IDLE: Duration = Duration::from_millis(220);
 /// How long the fill takes to slide onto the target or back to the origin.
 pub(super) const TAB_SWIPE_SETTLE: Duration = Duration::from_millis(120);
 const TAB_SWIPE_FRAME: Duration = Duration::from_millis(16);
-/// Events closer together than this only come from trackpads, which emit
-/// several per frame. Discrete mouse notches never arrive this fast.
-const FAST_GAP: Duration = Duration::from_millis(20);
-/// Fast gaps seen before the gesture counts as trackpad input. One is not
+/// Dense gaps seen before the gesture counts as trackpad input. One is not
 /// enough: a busy client can read two wheel notches in one batch.
-const TRACKPAD_FAST_EVENTS: u32 = 2;
-/// Gap at or above which an event counts as a discrete notch. Gaps between
-/// `FAST_GAP` and this are ambiguous, a fast wheel flick or a moderate
-/// trackpad swipe, and weigh 1 so the rarer failure is a switch that needs
-/// more input.
-const SPARSE_GAP: Duration = super::wheel_axis::WHEEL_NOTCH_GAP;
-/// Weight of a discrete notch, so a mouse wheel switches in a handful of clicks.
-const SPARSE_EVENT_WEIGHT: i32 = 8;
+const TRACKPAD_DENSE_EVENTS: u32 = 2;
 /// A committed swipe ignores input this long so the burst that committed it
 /// cannot immediately start another.
 const RESUME_MIN_AGE: Duration = Duration::from_millis(150);
@@ -62,17 +53,14 @@ pub(super) struct TabSwipe {
     /// How far the fill has moved from the origin toward the target, 0 to 1.
     /// Stays at 0 inside the dead zone.
     pub(super) progress: f32,
-    /// Net weighted wheel events so far. Positive moves toward the next tab.
+    /// Net wheel events so far, or a whole threshold after a notch. Positive
+    /// moves toward the next tab.
     steps: i32,
     /// When the last wheel event arrived, or when the swipe began.
     last_input: Instant,
     last_event: Option<Instant>,
-    /// The read the last event arrived in.
-    batch: Option<InputBatch>,
-    fast_events: u32,
-    /// Event times within the last two resume windows.
-    recent: VecDeque<Instant>,
-    /// The last `STEADY_GAPS + 1` reads that carried events, oldest first.
+    dense_events: u32,
+    /// Reads that carried events for this gesture, oldest first.
     reads: VecDeque<InputRead>,
     phase: TabSwipePhase,
 }
@@ -83,15 +71,6 @@ pub(super) struct TabSwipeTarget {
     pub(super) tab_id: String,
     /// The target sits at the far end of the strip, so the fill wraps around.
     pub(super) wraps: bool,
-}
-
-/// Events read from the terminal together. They share one timestamp but
-/// arrived over the gap since the previous read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct InputBatch {
-    /// The previous read, which this batch's events followed.
-    since: Instant,
-    len: usize,
 }
 
 /// One read of the terminal that carried wheel events for this gesture.
@@ -189,9 +168,7 @@ impl TabSwipe {
             steps: 0,
             last_input: now,
             last_event: None,
-            batch: None,
-            fast_events: 0,
-            recent: VecDeque::new(),
+            dense_events: 0,
             reads: VecDeque::new(),
             phase: TabSwipePhase::Tracking,
         }
@@ -211,17 +188,16 @@ impl TabSwipe {
         neighbors: TabSwipeNeighbors<'_>,
         now: Instant,
     ) -> TabSwipePush {
-        let gap = self.last_event.map(|last| now.duration_since(last));
-        self.record_event(gap, now);
-        if gap.is_some_and(|gap| gap < FAST_GAP) {
-            self.fast_events += 1;
+        let pace = self
+            .last_event
+            .map(|last| WheelPace::of(now.duration_since(last)));
+        self.record_event(now);
+        if pace == Some(WheelPace::Dense) {
+            self.dense_events += 1;
         }
-        let discrete_notch = !self.trackpad_input() && gap.is_some_and(|gap| gap >= SPARSE_GAP);
-        let weight = if discrete_notch {
-            SPARSE_EVENT_WEIGHT
-        } else {
-            1
-        };
+        // A sparse gap means a notch, unless this gesture has already shown
+        // itself to be a trackpad, where it is a momentum tail thinning out.
+        let discrete_notch = !self.trackpad_input() && pace == Some(WheelPace::Sparse);
         match self.phase {
             TabSwipePhase::Tracking => {}
             TabSwipePhase::SnappingBack { .. } => {
@@ -240,7 +216,13 @@ impl TabSwipe {
                 return TabSwipePush::Continue;
             }
         }
-        let mut steps = self.steps + delta.signum() * weight;
+        // A notch is a whole swipe. The first event of a gesture could still
+        // be the start of a trackpad stream, so the second one commits.
+        let mut steps = if discrete_notch {
+            delta.signum() * TAB_SWIPE_THRESHOLD as i32
+        } else {
+            self.steps + delta.signum()
+        };
         if neighbors.next.is_none() {
             steps = steps.min(0);
         }
@@ -294,51 +276,42 @@ impl TabSwipe {
             + (progress * (TAB_SWIPE_THRESHOLD - TAB_SWIPE_DEAD_ZONE) as f32).round() as u32
     }
 
-    /// Records the event's time for the rate test. Events read from the
-    /// terminal together share a timestamp but arrived over the gap since the
-    /// previous read, so a batch is spread evenly across that gap. A stalled
-    /// client's backlog then looks like the steady input it was, not a burst.
-    fn record_event(&mut self, gap: Option<Duration>, now: Instant) {
-        match (gap, &mut self.batch) {
-            (Some(Duration::ZERO), Some(batch)) => {
-                batch.len += 1;
-                let InputBatch { since, len } = *batch;
-                let span = now.duration_since(since);
-                self.recent
-                    .truncate(self.recent.len().saturating_sub(len - 1));
-                self.recent
-                    .extend((1..=len).map(|k| since + span * k as u32 / len as u32));
-            }
-            _ => {
-                self.batch = Some(InputBatch {
-                    since: self.last_event.unwrap_or(now),
-                    len: 1,
-                });
-                self.recent.push_back(now);
-            }
-        }
+    /// Records the event under the read it arrived in, keeping enough history
+    /// for both rate tests: the last `STEADY_GAPS + 1` reads and the last two
+    /// resume windows.
+    fn record_event(&mut self, now: Instant) {
         match self.reads.back_mut() {
             Some(read) if read.at == now => read.events += 1,
-            _ => {
-                self.reads.push_back(InputRead { at: now, events: 1 });
-                while self.reads.len() > STEADY_GAPS + 1 {
-                    self.reads.pop_front();
-                }
-            }
+            _ => self.reads.push_back(InputRead { at: now, events: 1 }),
+        }
+        while self.reads.len() > STEADY_GAPS + 1
+            && self
+                .reads
+                .front()
+                .is_some_and(|first| now.duration_since(first.at) > RESUME_WINDOW * 2)
+        {
+            self.reads.pop_front();
         }
         self.last_event = Some(now);
         self.last_input = now;
-        while self
-            .recent
-            .front()
-            .is_some_and(|first| now.duration_since(*first) > RESUME_WINDOW * 2)
-        {
-            self.recent.pop_front();
-        }
+    }
+
+    /// When each recorded event arrived. Events read from the terminal
+    /// together share a timestamp but arrived over the gap since the previous
+    /// read, so a read is spread evenly across that gap. A stalled client's
+    /// backlog then looks like the steady input it was, not a burst.
+    fn event_times(&self) -> impl Iterator<Item = Instant> + '_ {
+        let mut previous: Option<Instant> = None;
+        self.reads.iter().flat_map(move |read| {
+            let since = previous.unwrap_or(read.at);
+            previous = Some(read.at);
+            let span = read.at.duration_since(since);
+            (1..=read.events).map(move |step| since + span * step / read.events)
+        })
     }
 
     fn trackpad_input(&self) -> bool {
-        self.fast_events >= TRACKPAD_FAST_EVENTS
+        self.dense_events >= TRACKPAD_DENSE_EVENTS
     }
 
     /// Whether a trackpad event arriving after a commit belongs to a new swipe
@@ -352,12 +325,15 @@ impl TabSwipe {
         if delta.signum() != commit.direction {
             return true;
         }
-        let recent = self
-            .recent
-            .iter()
-            .filter(|at| now.duration_since(**at) <= RESUME_WINDOW)
-            .count();
-        let older = self.recent.len() - recent;
+        let mut recent = 0usize;
+        let mut older = 0usize;
+        for at in self.event_times() {
+            match now.duration_since(at) {
+                age if age <= RESUME_WINDOW => recent += 1,
+                age if age <= RESUME_WINDOW * 2 => older += 1,
+                _ => {}
+            }
+        }
         (recent >= RESUME_MIN_EVENTS && recent as f32 >= RESUME_RATIO * older as f32)
             || self.steady_slow_stream()
     }
@@ -367,28 +343,27 @@ impl TabSwipe {
     /// the earlier half. Reads rather than events, so a backlog a stalled
     /// client spreads over its stall cannot pass for level gaps.
     fn steady_slow_stream(&self) -> bool {
-        if self.reads.len() < STEADY_GAPS + 1
-            || self
-                .reads
-                .iter()
-                .any(|read| read.events > STEADY_READ_EVENTS)
-        {
+        let Some(skip) = self.reads.len().checked_sub(STEADY_GAPS + 1) else {
+            return false;
+        };
+        let reads = self.reads.iter().skip(skip);
+        if reads.clone().any(|read| read.events > STEADY_READ_EVENTS) {
             return false;
         }
-        let gaps = self
-            .reads
-            .iter()
-            .zip(self.reads.iter().skip(1))
-            .map(|(earlier, later)| later.at.duration_since(earlier.at).as_secs_f32())
+        let gaps = reads
+            .clone()
+            .zip(reads.skip(1))
+            .map(|(earlier, later)| later.at.duration_since(earlier.at))
             .collect::<Vec<_>>();
         let mut sorted = gaps.clone();
-        sorted.sort_by(f32::total_cmp);
-        if sorted[STEADY_GAPS / 2] < FAST_GAP.as_secs_f32() {
+        sorted.sort_unstable();
+        if WheelPace::of(sorted[STEADY_GAPS / 2]) == WheelPace::Dense {
             return false;
         }
+        // The halves are the same length, so their sums compare like means.
         let (earlier, later) = gaps.split_at(STEADY_GAPS / 2);
-        let mean = |half: &[f32]| half.iter().sum::<f32>() / half.len() as f32;
-        mean(later) <= STEADY_GROWTH * mean(earlier)
+        let total = |half: &[Duration]| half.iter().sum::<Duration>().as_secs_f32();
+        total(later) <= STEADY_GROWTH * total(earlier)
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> TabSwipeTick {
@@ -595,17 +570,14 @@ mod tests {
         let last = TabSwipeNeighbors::around(&tabs, 2);
         assert_eq!((last.previous, last.next), (Some("b"), Some("a")));
         assert!(!last.previous_wraps && last.next_wraps);
-    }
-
-    #[test]
-    fn a_lone_tab_has_no_neighbors_and_a_pair_shares_one() {
+        // A lone tab has nowhere to go; a pair reaches its one neighbor either way.
         let lone = ["a"].map(String::from);
-        let neighbors = TabSwipeNeighbors::around(&lone, 0);
-        assert_eq!((neighbors.previous, neighbors.next), (None, None));
+        let lone = TabSwipeNeighbors::around(&lone, 0);
+        assert_eq!((lone.previous, lone.next), (None, None));
         let pair = ["a", "b"].map(String::from);
-        let first = TabSwipeNeighbors::around(&pair, 0);
-        assert_eq!((first.previous, first.next), (Some("b"), Some("b")));
-        assert!(first.previous_wraps && !first.next_wraps);
+        let pair = TabSwipeNeighbors::around(&pair, 0);
+        assert_eq!((pair.previous, pair.next), (Some("b"), Some("b")));
+        assert!(pair.previous_wraps && !pair.next_wraps);
     }
 
     #[test]
@@ -735,62 +707,34 @@ mod tests {
     }
 
     #[test]
-    fn discrete_wheel_notches_switch_in_a_few_clicks() {
+    fn a_wheel_notch_commits_as_soon_as_it_can_be_told_from_a_swipe() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let mut at = now;
-        let mut notches = 0;
-        loop {
-            notches += 1;
-            let result = swipe.push(1, neighbors(), at);
-            if result == TabSwipePush::Commit("tab_next".into()) {
-                break;
-            }
-            assert!(notches < 10, "wheel needs too many notches");
-            at += Duration::from_millis(80);
-        }
-        assert_eq!(notches, 7);
-    }
-
-    #[test]
-    fn wheel_notches_keep_switching_tabs_without_a_pause() {
-        let now = Instant::now();
-        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let mut at = now;
-        let mut results = Vec::new();
-        for _ in 0..7 {
-            results.push(swipe.push(1, neighbors(), at));
-            at += Duration::from_millis(80);
-        }
+        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
+        let mut at = now + Duration::from_millis(80);
         assert_eq!(
-            results.last(),
-            Some(&TabSwipePush::Commit("tab_next".into()))
+            swipe.push(1, neighbors(), at),
+            TabSwipePush::Commit("tab_next".into())
         );
-        // The next notch lands during the settle and starts a new swipe
-        // instead of being swallowed as momentum, in either direction.
+        // Later notches keep switching instead of being swallowed as momentum,
+        // in either direction.
+        at += Duration::from_millis(80);
         assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Restart);
         at += Duration::from_millis(80);
         assert_eq!(swipe.push(-1, neighbors(), at), TabSwipePush::Restart);
     }
 
     #[test]
-    fn one_batched_notch_pair_keeps_wheel_weighting() {
-        // A busy client read two notches in one batch, so they share an instant.
+    fn notches_a_busy_client_read_together_commit_on_the_next_one() {
+        // Two notches in one read share an instant, so their gap says nothing.
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
         assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
         assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
-        let mut at = now;
-        let mut notches = 2;
-        loop {
-            at += Duration::from_millis(80);
-            notches += 1;
-            if swipe.push(1, neighbors(), at) == TabSwipePush::Commit("tab_next".into()) {
-                break;
-            }
-            assert!(notches < 10, "wheel needs too many notches");
-        }
-        assert_eq!(notches, 8);
+        assert_eq!(
+            swipe.push(1, neighbors(), now + Duration::from_millis(80)),
+            TabSwipePush::Commit("tab_next".into())
+        );
     }
 
     #[test]

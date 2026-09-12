@@ -54,7 +54,7 @@ use super::endpoint::{ClientEndpointId, ClientEndpointStatus, SavedSshEndpoint};
 use crate::app::state::Palette;
 use crate::config::{
     Config, LiveKeybindConfig, SidebarCollapsedModeConfig, SpacesSidebarConfig,
-    TabBarPositionConfig, TabSwipeTransitionConfig,
+    TabBarPositionConfig,
 };
 use crate::protocol::{
     ClientMessage, ClientMousePosition, ClientPaneInputEvent, ClientShellSnapshot, ClientShellTab,

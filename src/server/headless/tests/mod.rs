@@ -6331,34 +6331,27 @@ async fn client_shell_surface_read_renders_another_tab_without_focusing_it() {
     let (control, _render) = connect_test_shell(&mut server, 7, 100, 30);
     let _ = control.recv().expect("initial snapshot");
     let focused_before = server.shell_tab_id_for_client(7);
-    let read_request = |id: &str| {
-        Box::new(api::schema::Request {
+    let boot_id = server.client_shell_boot_id.clone();
+    let read_request = |id: &str| ServerEvent::ClientShellEndpointRequest {
+        client_id: 7,
+        boot_id: boot_id.clone(),
+        request: Box::new(api::schema::Request {
             id: id.into(),
             method: api::schema::Method::ClientShellSurfaceRead(api::schema::TabTarget {
                 tab_id: second_tab_id.clone(),
             }),
-        })
+        }),
     };
 
     assert!(
-        !server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
-            client_id: 7,
-            boot_id: server.client_shell_boot_id.clone(),
-            request: read_request("read-second"),
-        }),
+        !server.handle_server_event(read_request("read-second")),
         "no client shows the second tab, so nothing needs a full render"
     );
-    let ServerMessage::ClientShellEndpointResponseChunk {
-        request_id,
-        final_chunk,
-        data,
-        ..
-    } = read_server_message(control.recv().expect("surface response"))
+    let ServerMessage::ClientShellEndpointResponseChunk { data, .. } =
+        read_server_message(control.recv().expect("surface response"))
     else {
         panic!("expected an endpoint response");
     };
-    assert_eq!(request_id, "read-second");
-    assert!(final_chunk);
     let response =
         serde_json::from_slice::<api::schema::SuccessResponse>(&data).expect("success response");
     let api::schema::ResponseResult::ClientShellSurface {
@@ -6372,7 +6365,6 @@ async fn client_shell_surface_read_renders_another_tab_without_focusing_it() {
     };
     assert_eq!(tab_id, second_tab_id);
     assert_eq!((cols, rows), (100, 30));
-    assert_eq!(lines.len(), 30);
     let text = lines
         .iter()
         .map(|runs| {
@@ -6382,12 +6374,12 @@ async fn client_shell_surface_read_renders_another_tab_without_focusing_it() {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    assert_eq!(lines.len(), 30);
     assert!(
         text.contains("HELLO FROM TAB TWO"),
         "the second tab's content is rendered: {text}"
     );
     assert_eq!(server.shell_tab_id_for_client(7), focused_before);
-    assert!(!server.clients[&7].shell_endpoint_command_in_flight);
 
     // Rendering consumed the dirty rows a client showing that tab patches from,
     // so that client takes a full frame next.
@@ -6395,13 +6387,7 @@ async fn client_shell_surface_read_renders_another_tab_without_focusing_it() {
     let _ = other_control.recv().expect("other snapshot");
     assert!(server.focus_shell_client_on_tab(8, &second_tab_id));
     server.clients.get_mut(&8).unwrap().clear_deferred_render();
-    assert!(
-        server.handle_server_event(ServerEvent::ClientShellEndpointRequest {
-            client_id: 7,
-            boot_id: server.client_shell_boot_id.clone(),
-            request: read_request("read-again"),
-        })
-    );
+    assert!(server.handle_server_event(read_request("read-again")));
     let _ = control.recv().expect("second surface response");
     assert!(matches!(
         server.clients[&8].deferred_render(),

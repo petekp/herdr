@@ -294,29 +294,12 @@ impl ClientShellState {
         });
         let sliding = match self.tab_slide(&surface.frame, layout.pane_surface) {
             Some(slide) => {
-                match self.config.tab_swipe_transition {
-                    TabSwipeTransitionConfig::Slide => super::tab_slide::compose_tab_slide(
-                        &mut frame,
-                        layout.pane_surface,
-                        slide,
-                        &self.config.palette,
-                        0.0,
-                    ),
-                    TabSwipeTransitionConfig::StaggeredSlide => {
-                        super::tab_slide::compose_tab_slide(
-                            &mut frame,
-                            layout.pane_surface,
-                            slide,
-                            &self.config.palette,
-                            super::tab_slide::TAB_SLIDE_ROW_STAGGER,
-                        )
-                    }
-                    TabSwipeTransitionConfig::Dissolve => super::tab_slide::compose_tab_dissolve(
-                        &mut frame,
-                        layout.pane_surface,
-                        slide,
-                    ),
-                }
+                super::tab_slide::compose_tab_slide(
+                    &mut frame,
+                    layout.pane_surface,
+                    slide,
+                    &self.config.palette,
+                );
                 true
             }
             None => {

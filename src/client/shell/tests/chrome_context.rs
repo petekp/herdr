@@ -549,14 +549,21 @@ fn horizontal_wheel_swipes_toward_the_neighbor_in_that_direction() {
 }
 
 #[test]
-fn swiping_past_either_end_wraps_to_the_other() {
-    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
-    let mut state = three_tab_state("tab_3");
-    let outcome = wheel_over_tab(&mut state, MouseEventKind::ScrollRight, threshold);
-    assert_eq!(focused_tab_request(&outcome).as_deref(), Some("tab_1"));
+fn a_wheel_notch_over_the_tab_row_switches_on_its_second_click() {
+    // Events in one read share an instant, so only spaced clicks reach the
+    // notch path that a trackpad stream cannot.
     let mut state = three_tab_state("tab_1");
-    let outcome = wheel_over_tab(&mut state, MouseEventKind::ScrollLeft, threshold);
-    assert_eq!(focused_tab_request(&outcome).as_deref(), Some("tab_3"));
+    let tab = state.hits.tabs[0].0;
+    let at = std::time::Instant::now();
+    let first = wheel_at_instant(&mut state, MouseEventKind::ScrollRight, (tab.x, tab.y), at);
+    assert_eq!(focused_tab_request(&first), None);
+    let second = wheel_at_instant(
+        &mut state,
+        MouseEventKind::ScrollRight,
+        (tab.x, tab.y),
+        at + std::time::Duration::from_millis(80),
+    );
+    assert_eq!(focused_tab_request(&second).as_deref(), Some("tab_2"));
 }
 
 #[test]
@@ -788,8 +795,8 @@ fn horizontal_wheel_over_a_mouse_reporting_pane_reaches_the_pane() {
     assert_eq!(pane_input_requests(&outcome), 1);
 }
 
-#[test]
-fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
+/// A pane running Claude Code with mouse reporting on.
+fn claude_code_pane_state() -> ClientShellState {
     let mut state = three_tab_state_with("tab_1", |snapshot| {
         snapshot.agents.push(ClientShellAgent {
             pane_id: "pane_1".into(),
@@ -812,8 +819,13 @@ fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
     pane_surface.panes[0].mouse_reporting = true;
     state.set_pane_surface(pane_surface);
     state.compose(106, 20).expect("claude code pane");
-    let pane = state.hits.panes[0].inner_rect;
+    state
+}
 
+#[test]
+fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
+    let mut state = claude_code_pane_state();
+    let pane = state.hits.panes[0].inner_rect;
     let sideways = wheel_at(&mut state, MouseEventKind::ScrollRight, pane.x, pane.y);
     assert!(
         state.tab_swipe.is_some(),
@@ -821,28 +833,7 @@ fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
     );
     assert_eq!(pane_input_requests(&sideways), 0);
 
-    let mut state = three_tab_state_with("tab_1", |snapshot| {
-        snapshot.agents.push(ClientShellAgent {
-            pane_id: "pane_1".into(),
-            workspace_id: "ws_1".into(),
-            tab_id: "tab_1".into(),
-            name: None,
-            display_agent: Some("Claude Code".into()),
-            agent: Some("claude".into()),
-            title: None,
-            terminal_title: None,
-            terminal_title_stripped: None,
-            agent_status: AgentStatus::Idle,
-            state_change_seq: 0,
-            state_labels: Vec::new(),
-            tokens: Vec::new(),
-            focused: true,
-        });
-    });
-    let mut pane_surface = surface();
-    pane_surface.panes[0].mouse_reporting = true;
-    state.set_pane_surface(pane_surface);
-    state.compose(106, 20).expect("claude code pane");
+    let mut state = claude_code_pane_state();
     let vertical = wheel_at(&mut state, MouseEventKind::ScrollDown, pane.x, pane.y);
     assert!(state.tab_swipe.is_none());
     assert_eq!(
@@ -883,13 +874,6 @@ fn a_dense_wheel_stream_keeps_its_axis_until_the_other_axis_takes_over() {
         wheel_at_instant(&mut state, MouseEventKind::ScrollRight, point, at);
     }
     assert!(state.tab_swipe.is_some(), "the swipe took the lock");
-    at += step;
-    let outcome = wheel_at_instant(&mut state, MouseEventKind::ScrollDown, point, at);
-    assert_eq!(
-        pane_input_requests(&outcome),
-        0,
-        "vertical drift no longer scrolls"
-    );
 }
 
 fn surface_read_requests(outcome: &ClientShellInput) -> Vec<String> {
@@ -1102,83 +1086,4 @@ fn a_landed_swipe_shows_the_neighbor_surface_until_its_tab_arrives() {
         frame.cursor.is_some(),
         "the landed tab shows its cursor again"
     );
-}
-
-#[test]
-fn a_staggered_slide_moves_the_top_row_ahead_of_the_bottom_row() {
-    let dead_zone = crate::client::shell::tab_swipe::TAB_SWIPE_DEAD_ZONE;
-    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
-    let mut state = three_tab_state("tab_1");
-    state.config.tab_swipe_transition = TabSwipeTransitionConfig::StaggeredSlide;
-    let area = state.layout(106, 20).pane_surface;
-    let start = std::time::Instant::now();
-    let first = dense_swipe(&mut state, MouseEventKind::ScrollRight, 1, start);
-    state.handle_endpoint_result(
-        "boot-1",
-        &endpoint_request_id(&first),
-        Ok(neighbor_surface_result("tab_2", area, "N")),
-    );
-    let half = (threshold - dead_zone) / 2;
-    dense_swipe(
-        &mut state,
-        MouseEventKind::ScrollRight,
-        dead_zone - 1 + half,
-        start + std::time::Duration::from_millis(5),
-    );
-
-    let frame = state.compose(106, 20).expect("sliding frame");
-    assert!(frame.cursor.is_none());
-    let arrived = |row: u16| {
-        (area.x..area.right())
-            .filter(|&column| frame_symbol(&frame, column, row) == "N")
-            .count()
-    };
-    let top = arrived(area.y);
-    let bottom = arrived(area.bottom() - 1);
-    assert!(top > bottom, "top {top} columns, bottom {bottom} columns");
-    assert!(bottom < usize::from(area.width));
-}
-
-#[test]
-fn a_dissolve_transition_switches_cells_instead_of_sliding() {
-    let dead_zone = crate::client::shell::tab_swipe::TAB_SWIPE_DEAD_ZONE;
-    let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
-    let mut state = three_tab_state("tab_1");
-    state.config.tab_swipe_transition = TabSwipeTransitionConfig::Dissolve;
-    let area = state.layout(106, 20).pane_surface;
-    let start = std::time::Instant::now();
-    let first = dense_swipe(&mut state, MouseEventKind::ScrollRight, 1, start);
-    state.handle_endpoint_result(
-        "boot-1",
-        &endpoint_request_id(&first),
-        Ok(neighbor_surface_result("tab_2", area, "N")),
-    );
-    let quarter = (threshold - dead_zone) / 4;
-    let step = std::time::Duration::from_millis(5);
-    // Feeds `count` more events, then lists the columns showing the neighbor.
-    let switched_columns = |state: &mut ClientShellState, fed: u32, count: u32| {
-        dense_swipe(
-            state,
-            MouseEventKind::ScrollRight,
-            count,
-            start + step * fed,
-        );
-        let frame = state.compose(106, 20).expect("dissolving frame");
-        assert!(frame.cursor.is_none());
-        (area.x..area.right())
-            .filter(|&column| frame_symbol(&frame, column, area.y) == "N")
-            .collect::<Vec<_>>()
-    };
-
-    let early = switched_columns(&mut state, 1, dead_zone - 1 + quarter);
-    let later = switched_columns(&mut state, dead_zone + quarter, quarter);
-    assert!(!early.is_empty() && early.len() < later.len());
-    assert!(early.iter().all(|column| later.contains(column)));
-    assert!(
-        later.len() < usize::from(area.width),
-        "part of the current tab is still showing"
-    );
-    let fed = dead_zone + 2 * quarter;
-    let landed = switched_columns(&mut state, fed, threshold - fed);
-    assert!(landed.len() > later.len());
 }

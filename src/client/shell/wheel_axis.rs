@@ -3,10 +3,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::MouseEventKind;
 
+/// Gap below which only a trackpad can be delivering events, since they emit
+/// several per frame. Discrete mouse notches never arrive this fast.
+const DENSE_GAP: Duration = Duration::from_millis(20);
 /// Gap at or above which a wheel event is a discrete notch, a momentum tail,
 /// or a slow deliberate scroll rather than part of a dense trackpad stream.
 /// Nothing drifts at these rates, so such events bypass the axis lock.
-pub(super) const WHEEL_NOTCH_GAP: Duration = Duration::from_millis(40);
+const SPARSE_GAP: Duration = Duration::from_millis(40);
 /// Quiet time after which the next wheel event starts a new gesture on its
 /// own axis, whatever the previous gesture was doing.
 pub(super) const WHEEL_QUIET_GAP: Duration = Duration::from_millis(200);
@@ -15,6 +18,29 @@ pub(super) const WHEEL_QUIET_GAP: Duration = Duration::from_millis(200);
 /// other axis does within a few events, even while the old gesture's momentum
 /// is still arriving in between.
 const TAKEOVER_RUN: usize = 5;
+
+/// What the gap before a wheel event says about the device behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WheelPace {
+    /// Part of a dense trackpad stream.
+    Dense,
+    /// A fast wheel flick or a moderate trackpad swipe; either is possible.
+    Ambiguous,
+    /// A discrete notch, a momentum tail, or a slow deliberate scroll.
+    Sparse,
+}
+
+impl WheelPace {
+    pub(super) fn of(gap: Duration) -> Self {
+        if gap < DENSE_GAP {
+            Self::Dense
+        } else if gap < SPARSE_GAP {
+            Self::Ambiguous
+        } else {
+            Self::Sparse
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WheelAxis {
@@ -62,7 +88,7 @@ impl WheelAxisLock {
             current.recent = VecDeque::from([axis]);
             return true;
         }
-        if gap >= WHEEL_NOTCH_GAP {
+        if WheelPace::of(gap) == WheelPace::Sparse {
             return true;
         }
         current.recent.push_back(axis);

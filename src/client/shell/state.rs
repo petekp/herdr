@@ -76,7 +76,6 @@ pub(crate) struct ClientShellConfig {
     pub(super) sidebar_collapsed_mode: SidebarCollapsedModeConfig,
     pub(super) mobile_width_threshold: u16,
     pub(super) tab_bar_position: TabBarPositionConfig,
-    pub(super) tab_swipe_transition: TabSwipeTransitionConfig,
     pub(super) hide_tab_bar_when_single_tab: bool,
     pub(super) spaces: SpacesSidebarConfig,
     pub(super) agents: crate::config::AgentsSidebarConfig,
@@ -1260,8 +1259,7 @@ impl ClientShellState {
         self.chrome_drag = None;
         self.workspace_press = None;
         self.tab_press = None;
-        self.tab_swipe = None;
-        self.neighbor_surfaces.clear();
+        self.end_tab_swipe();
         self.workspace_scroll = 0;
         self.agent_scroll = 0;
         self.tab_scroll = 0;
@@ -1440,8 +1438,7 @@ impl ClientShellState {
                     !snapshot.tabs.iter().any(|tab| tab.tab_id == target.tab_id)
                 })
         }) {
-            self.tab_swipe = None;
-            self.neighbor_surfaces.clear();
+            self.end_tab_swipe();
         }
         if tab_layout_changed
             || self
@@ -1694,8 +1691,7 @@ impl ClientShellState {
             self.chrome_drag = None;
             self.workspace_press = None;
             self.tab_press = None;
-            self.tab_swipe = None;
-            self.neighbor_surfaces.clear();
+            self.end_tab_swipe();
             if self.pane_mouse_gesture.as_ref().is_some_and(|gesture| {
                 gesture.hit.popup && previous_popup.as_deref() == Some(gesture.hit.pane_id.as_str())
             }) {
@@ -1866,14 +1862,19 @@ impl ClientShellState {
             .unwrap_or(delay)
     }
 
+    /// Drops a swipe in flight along with the neighbor surfaces it fetched.
+    fn end_tab_swipe(&mut self) {
+        self.tab_swipe = None;
+        self.neighbor_surfaces.clear();
+    }
+
     pub(crate) fn tick_tab_swipe(&mut self, now: std::time::Instant) -> bool {
         let Some(swipe) = self.tab_swipe.as_mut() else {
             return false;
         };
         let tick = swipe.tick(now);
         if tick.finished {
-            self.tab_swipe = None;
-            self.neighbor_surfaces.clear();
+            self.end_tab_swipe();
             return true;
         }
         tick.repaint

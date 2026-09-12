@@ -14,10 +14,6 @@ const NEIGHBOR_SURFACES: usize = 4;
 /// Columns of chrome between the outgoing and incoming content.
 const TAB_SLIDE_GAP: u16 = 1;
 
-/// Share of a staggered slide over which rows start moving in turn, top row
-/// first: the bottom row starts once the swipe reaches this progress.
-pub(super) const TAB_SLIDE_ROW_STAGGER: f32 = 0.4;
-
 /// The two surfaces a swipe moves across the pane area, and how far along.
 pub(super) struct TabSlide<'a> {
     /// Content of the tab the swipe started on. `None` shows a blank surface.
@@ -192,109 +188,35 @@ fn blank_cell() -> crate::protocol::CellData {
 /// Draws the swipe across `area`: the outgoing content moves out, a gap of
 /// chrome follows it, and the incoming content moves in after the gap.
 /// Content moves in whole columns; at `progress` 1 the incoming content is in place.
-/// `row_stagger` is the share of the swipe over which rows start moving in
-/// turn from the top; 0 moves every row together.
 pub(super) fn compose_tab_slide(
     frame: &mut FrameData,
     area: Rect,
     slide: TabSlide<'_>,
     palette: &Palette,
-    row_stagger: f32,
 ) {
     let width = i32::from(area.width);
     let travel = width + i32::from(TAB_SLIDE_GAP);
     let direction = if slide.direction < 0 { -1 } else { 1 };
-    let progress = slide.progress.clamp(0.0, 1.0);
-    let last_row = f32::from(area.height.saturating_sub(1)).max(1.0);
-    // Columns `row` has moved so far; rows further down start later.
-    let offset = |row: u16| {
-        let start = row_stagger * f32::from(row) / last_row;
-        let row_progress = ((progress - start) / (1.0 - row_stagger)).clamp(0.0, 1.0);
-        ((row_progress * travel as f32).round() as i32).clamp(0, travel)
-    };
-    let outgoing_shift = |row: u16| -direction * offset(row);
-    let incoming_shift = |row: u16| direction * (travel - offset(row));
+    // Columns the content has moved so far.
+    let offset = ((slide.progress.clamp(0.0, 1.0) * travel as f32).round() as i32).clamp(0, travel);
+    let outgoing_shift = -direction * offset;
+    let incoming_shift = direction * (travel - offset);
     fill_blank(frame, area);
     if let Some(outgoing) = slide.outgoing {
-        blit_rows_shifted(frame, outgoing, area, outgoing_shift);
+        blit_shifted(frame, outgoing, area, outgoing_shift);
     }
     if let Some(incoming) = slide.incoming {
-        blit_rows_shifted(frame, incoming, area, incoming_shift);
+        blit_shifted(frame, incoming, area, incoming_shift);
     }
-    let gap_start = |row: u16| {
-        if direction > 0 {
-            outgoing_shift(row) + width
-        } else {
-            incoming_shift(row) + width
-        }
+    // The seam trails whichever surface leads in the swipe direction.
+    let leading_shift = if direction > 0 {
+        outgoing_shift
+    } else {
+        incoming_shift
     };
-    paint_gap(frame, area, gap_start, palette);
+    paint_gap(frame, area, leading_shift + width, palette);
     frame.cursor = None;
     frame.graphics.clear();
-}
-
-/// Draws the swipe as a dissolve: a cell shows the incoming content once
-/// `progress` passes that cell's fixed threshold, so cells switch one by one
-/// in a grain pattern that stays put from frame to frame.
-pub(super) fn compose_tab_dissolve(frame: &mut FrameData, area: Rect, slide: TabSlide<'_>) {
-    let progress = slide.progress.clamp(0.0, 1.0);
-    let blank = blank_cell();
-    let outgoing = slide
-        .outgoing
-        .map(|source| (source, push_hyperlinks(frame, source)));
-    let incoming = slide
-        .incoming
-        .map(|source| (source, push_hyperlinks(frame, source)));
-    for row in 0..area.height {
-        for col in 0..area.width {
-            let source = if progress > dissolve_threshold(col, row) {
-                incoming
-            } else {
-                outgoing
-            };
-            let cell = source
-                .and_then(|(source, hyperlink_base)| {
-                    let mut cell = frame_cell(source, col, row)?.clone();
-                    cell.hyperlink = cell.hyperlink.and_then(|index| {
-                        ((index as usize) < source.hyperlinks.len())
-                            .then_some(hyperlink_base + index)
-                    });
-                    Some(cell)
-                })
-                .unwrap_or_else(|| blank.clone());
-            if let Some(target) = frame_cell_mut(frame, area.x + col, area.y + row) {
-                *target = cell;
-            }
-        }
-    }
-    frame.cursor = None;
-    frame.graphics.clear();
-}
-
-/// A fixed value in [0, 1) for each cell position, spread like grain.
-fn dissolve_threshold(col: u16, row: u16) -> f32 {
-    let mut hash = ((u32::from(row) << 16) | u32::from(col)).wrapping_mul(0x9E37_79B1);
-    hash ^= hash >> 15;
-    hash = hash.wrapping_mul(0x85EB_CA77);
-    hash ^= hash >> 13;
-    (hash >> 8) as f32 / (1u32 << 24) as f32
-}
-
-/// Appends `source`'s hyperlink table to `target` and returns the index base
-/// the copied cells need.
-fn push_hyperlinks(target: &mut FrameData, source: &FrameData) -> u32 {
-    let base = target.hyperlinks.len() as u32;
-    target.hyperlinks.extend(source.hyperlinks.iter().cloned());
-    base
-}
-
-fn frame_cell(frame: &FrameData, x: u16, y: u16) -> Option<&crate::protocol::CellData> {
-    if x >= frame.width || y >= frame.height {
-        return None;
-    }
-    frame
-        .cells
-        .get(usize::from(y) * usize::from(frame.width) + usize::from(x))
 }
 
 fn fill_blank(frame: &mut FrameData, area: Rect) {
@@ -308,7 +230,7 @@ fn fill_blank(frame: &mut FrameData, area: Rect) {
     }
 }
 
-fn paint_gap(frame: &mut FrameData, area: Rect, gap_start: impl Fn(u16) -> i32, palette: &Palette) {
+fn paint_gap(frame: &mut FrameData, area: Rect, start: i32, palette: &Palette) {
     let mut cell = ratatui::buffer::Cell::new("│");
     cell.set_style(
         Style::default()
@@ -317,7 +239,6 @@ fn paint_gap(frame: &mut FrameData, area: Rect, gap_start: impl Fn(u16) -> i32, 
     );
     let gap = crate::protocol::CellData::from_ratatui_cell(&cell);
     for row in 0..area.height {
-        let start = gap_start(row);
         for column in start..start + i32::from(TAB_SLIDE_GAP) {
             let Ok(column) = u16::try_from(column) else {
                 continue;
@@ -345,16 +266,6 @@ fn frame_cell_mut(frame: &mut FrameData, x: u16, y: u16) -> Option<&mut crate::p
 /// that fall outside. A wide glyph cut by an edge becomes a blank so it cannot
 /// spill past the edge.
 pub(super) fn blit_shifted(target: &mut FrameData, source: &FrameData, area: Rect, shift: i32) {
-    blit_rows_shifted(target, source, area, |_| shift);
-}
-
-/// `blit_shifted` with the shift chosen per row.
-fn blit_rows_shifted(
-    target: &mut FrameData,
-    source: &FrameData,
-    area: Rect,
-    shift: impl Fn(u16) -> i32,
-) {
     let copy_height = source.height.min(area.height);
     let hyperlink_base = target.hyperlinks.len() as u32;
     target.hyperlinks.extend(source.hyperlinks.iter().cloned());
@@ -362,7 +273,6 @@ fn blit_rows_shifted(
     let wide = |cell: &crate::protocol::CellData| super::render::display_width(&cell.symbol) > 1;
 
     for row in 0..copy_height {
-        let shift = shift(row);
         let cells =
             &source.cells[usize::from(row) * source_width..usize::from(row + 1) * source_width];
         for (col, source_cell) in cells.iter().enumerate() {
@@ -439,57 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn a_dissolve_switches_cells_one_by_one_in_a_fixed_order() {
-        let area = Rect::new(0, 0, 20, 5);
-        let outgoing = frame(&["o".repeat(20).as_str(); 5]);
-        let incoming = frame(&["n".repeat(20).as_str(); 5]);
-        let compose = |progress: f32| {
-            let mut composed = frame(&[" ".repeat(20).as_str(); 5]);
-            compose_tab_dissolve(
-                &mut composed,
-                area,
-                TabSlide {
-                    outgoing: Some(&outgoing),
-                    incoming: Some(&incoming),
-                    direction: 1,
-                    progress,
-                },
-            );
-            composed
-                .cells
-                .iter()
-                .enumerate()
-                .filter(|(_, cell)| cell.symbol == "n")
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>()
-        };
-
-        let early = compose(0.25);
-        let half = compose(0.5);
-        let done = compose(1.0);
-        assert!(!early.is_empty() && early.len() < half.len());
-        assert!(
-            (35..=65).contains(&half.len()),
-            "{} of 100 cells",
-            half.len()
-        );
-        assert!(
-            early.iter().all(|index| half.contains(index)),
-            "cells never switch back"
-        );
-        assert_eq!(done.len(), 100);
-        assert_eq!(compose(0.5), half, "the pattern is fixed");
-    }
-
-    #[test]
-    fn a_staggered_slide_moves_the_top_row_first() {
-        let area = Rect::new(0, 0, 20, 5);
-        let outgoing = frame(&["o".repeat(20).as_str(); 5]);
-        let incoming = frame(&["n".repeat(20).as_str(); 5]);
+    fn the_outgoing_content_leaves_ahead_of_a_seam_with_the_neighbor_behind_it() {
+        let area = Rect::new(0, 0, 6, 1);
+        let outgoing = frame(&["oooooo"]);
+        let incoming = frame(&["nnnnnn"]);
         let palette = Palette::catppuccin();
-        // Columns showing the incoming content, row by row from the top.
-        let incoming_columns = |direction: i32, progress: f32| {
-            let mut composed = frame(&[" ".repeat(20).as_str(); 5]);
+        let compose = |direction: i32, progress: f32| {
+            let mut composed = frame(&["      "]);
             compose_tab_slide(
                 &mut composed,
                 area,
@@ -500,28 +366,21 @@ mod tests {
                     progress,
                 },
                 &palette,
-                0.5,
             );
-            (0..5)
-                .map(|row| {
-                    composed.cells[row * 20..(row + 1) * 20]
-                        .iter()
-                        .filter(|cell| cell.symbol == "n")
-                        .count()
-                })
-                .collect::<Vec<_>>()
+            symbols(&composed).concat()
         };
 
-        assert_eq!(incoming_columns(1, 0.0), [0; 5]);
-        let half = incoming_columns(1, 0.5);
-        assert_eq!(half[0], 20, "the top row has arrived");
-        assert_eq!(half[4], 0, "the bottom row has not started");
-        assert!(half.windows(2).all(|pair| pair[0] > pair[1]), "{half:?}");
-        assert_eq!(incoming_columns(1, 1.0), [20; 5]);
+        assert_eq!(compose(1, 0.0), "oooooo");
         assert_eq!(
-            incoming_columns(-1, 0.5),
-            half,
-            "a swipe the other way enters from the left in the same order"
+            compose(1, 0.5),
+            "oo│nnn",
+            "the seam follows the outgoing content out"
+        );
+        assert_eq!(compose(1, 1.0), "nnnnnn");
+        assert_eq!(
+            compose(-1, 0.5),
+            "nnn│oo",
+            "a swipe the other way enters from the left"
         );
     }
 

@@ -172,29 +172,8 @@ pub(crate) fn render_tab_bar(
         }
     }
 
-    if let (Some(swipe), Some((origin, origin_style))) = (tab_swipe, swipe_origin) {
-        let wraps = swipe.target.as_ref().is_some_and(|target| target.wraps);
-        match swipe_target {
-            Some(target) if !wraps => render_tab_swipe_fill(
-                buffer,
-                palette,
-                origin,
-                origin_style,
-                target,
-                swipe.progress,
-            ),
-            // Wrapping around the strip, or a neighbor scrolled out of view:
-            // the fill leaves the origin through the strip's edge.
-            target => render_tab_swipe_drain(
-                buffer,
-                palette,
-                origin,
-                origin_style,
-                target,
-                swipe.direction(),
-                swipe.progress,
-            ),
-        }
+    if let (Some(swipe), Some(origin)) = (tab_swipe, swipe_origin) {
+        render_tab_swipe_fill(buffer, palette, swipe, origin, swipe_target);
     }
 
     if overflow && mouse_chrome {
@@ -291,62 +270,55 @@ pub(crate) fn render_tab_bar(
 /// Left-aligned partial blocks, indexed by eighths filled.
 const SWIPE_EDGE_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
 
-/// Draws the focused-tab fill part way between the origin and target tabs.
+/// Draws the focused-tab fill part way from the origin tab toward the target.
+/// A target beside the origin takes one span that slides across the space
+/// between them. When the swipe wraps around the strip, or the target is
+/// scrolled out of view, the fill instead leaves the origin through the
+/// strip's edge while the same share grows into the target from its far side.
 fn render_tab_swipe_fill(
     buffer: &mut Buffer,
     palette: &Palette,
-    origin: Rect,
-    origin_style: Style,
-    target: Rect,
-    progress: f32,
-) {
-    buffer.set_style(origin, origin_style.remove_modifier(Modifier::BOLD));
-    let lerp = |from: u16, to: u16| f32::from(from) + (f32::from(to) - f32::from(from)) * progress;
-    paint_fill_span(
-        buffer,
-        palette,
-        origin.y,
-        lerp(origin.x, target.x),
-        lerp(origin.right(), target.right()),
-    );
-}
-
-/// Draws a fill leaving the origin through the strip's edge in the swipe
-/// direction while the same share grows into the target from its far side.
-/// Used when the swipe wraps around the strip and when the neighbor is
-/// scrolled out of view; without a visible target only the draining half shows.
-fn render_tab_swipe_drain(
-    buffer: &mut Buffer,
-    palette: &Palette,
-    origin: Rect,
-    origin_style: Style,
+    swipe: &super::super::tab_swipe::TabSwipe,
+    (origin, origin_style): (Rect, Style),
     target: Option<Rect>,
-    direction: i32,
-    progress: f32,
 ) {
     buffer.set_style(origin, origin_style.remove_modifier(Modifier::BOLD));
-    let remaining = f32::from(origin.width) * (1.0 - progress);
-    let entered = target.map_or(0.0, |target| f32::from(target.width) * progress);
-    let y = origin.y;
-    if direction < 0 {
-        paint_fill_span(
-            buffer,
-            palette,
-            y,
-            f32::from(origin.x),
-            f32::from(origin.x) + remaining,
-        );
-        if let Some(target) = target {
-            let right = f32::from(target.right());
-            paint_fill_span(buffer, palette, y, right - entered, right);
+    let progress = swipe.progress;
+    let wraps = swipe.target.as_ref().is_some_and(|target| target.wraps);
+    let spans: [Option<(f32, f32)>; 2] = match target {
+        Some(target) if !wraps => {
+            let lerp =
+                |from: u16, to: u16| f32::from(from) + (f32::from(to) - f32::from(from)) * progress;
+            [
+                Some((
+                    lerp(origin.x, target.x),
+                    lerp(origin.right(), target.right()),
+                )),
+                None,
+            ]
         }
-    } else {
-        let right = f32::from(origin.right());
-        paint_fill_span(buffer, palette, y, right - remaining, right);
-        if let Some(target) = target {
-            let left = f32::from(target.x);
-            paint_fill_span(buffer, palette, y, left, left + entered);
+        target => {
+            let leaving = f32::from(origin.width) * (1.0 - progress);
+            let entered = target.map_or(0.0, |target| f32::from(target.width) * progress);
+            if swipe.direction() < 0 {
+                [
+                    Some((f32::from(origin.x), f32::from(origin.x) + leaving)),
+                    target.map(|target| {
+                        let right = f32::from(target.right());
+                        (right - entered, right)
+                    }),
+                ]
+            } else {
+                let right = f32::from(origin.right());
+                [
+                    Some((right - leaving, right)),
+                    target.map(|target| (f32::from(target.x), f32::from(target.x) + entered)),
+                ]
+            }
         }
+    };
+    for (start, end) in spans.into_iter().flatten() {
+        paint_fill_span(buffer, palette, origin.y, start, end);
     }
 }
 
