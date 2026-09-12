@@ -38,6 +38,17 @@ const RESUME_MIN_EVENTS: usize = 12;
 /// ...and how much faster than the previous window it has to be. Momentum
 /// only decays, so a rise this sharp means the fingers came back.
 const RESUME_RATIO: f32 = 2.5;
+/// Gaps between reads a slow stream must hold level before it counts as a new
+/// swipe while the last one cools down. A momentum tail's gaps grow the whole
+/// time; a finger moving slowly keeps them level.
+const STEADY_GAPS: usize = 12;
+/// How much the later half of those gaps may exceed the earlier half. Tails
+/// measured on macOS grow at least 1.5x between halves once they are sparse.
+const STEADY_GROWTH: f32 = 1.25;
+/// Most events one read may hold and still count toward a steady stream. A
+/// slow finger crosses at most a couple of cells between reads; a stalled
+/// client's backlog says nothing about the finger.
+const STEADY_READ_EVENTS: u32 = 2;
 
 /// A wheel-driven tab switch in progress. Wheel events carry no distance, so
 /// the gesture counts them and commits once one direction reaches the threshold.
@@ -61,6 +72,8 @@ pub(super) struct TabSwipe {
     fast_events: u32,
     /// Event times within the last two resume windows.
     recent: VecDeque<Instant>,
+    /// The last `STEADY_GAPS + 1` reads that carried events, oldest first.
+    reads: VecDeque<InputRead>,
     phase: TabSwipePhase,
 }
 
@@ -79,6 +92,13 @@ struct InputBatch {
     /// The previous read, which this batch's events followed.
     since: Instant,
     len: usize,
+}
+
+/// One read of the terminal that carried wheel events for this gesture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct InputRead {
+    at: Instant,
+    events: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -172,6 +192,7 @@ impl TabSwipe {
             batch: None,
             fast_events: 0,
             recent: VecDeque::new(),
+            reads: VecDeque::new(),
             phase: TabSwipePhase::Tracking,
         }
     }
@@ -296,6 +317,15 @@ impl TabSwipe {
                 self.recent.push_back(now);
             }
         }
+        match self.reads.back_mut() {
+            Some(read) if read.at == now => read.events += 1,
+            _ => {
+                self.reads.push_back(InputRead { at: now, events: 1 });
+                while self.reads.len() > STEADY_GAPS + 1 {
+                    self.reads.pop_front();
+                }
+            }
+        }
         self.last_event = Some(now);
         self.last_input = now;
         while self
@@ -312,7 +342,9 @@ impl TabSwipe {
     }
 
     /// Whether a trackpad event arriving after a commit belongs to a new swipe
-    /// rather than the momentum tail of the one that committed.
+    /// rather than the momentum tail of the one that committed: the fingers
+    /// came back fast, or they have been moving slowly and steadily for a
+    /// while, which a decaying tail never does.
     fn fresh_swipe(&self, delta: i32, commit: TabSwipeCommit, now: Instant) -> bool {
         if now.duration_since(commit.at) < RESUME_MIN_AGE {
             return false;
@@ -326,7 +358,37 @@ impl TabSwipe {
             .filter(|at| now.duration_since(**at) <= RESUME_WINDOW)
             .count();
         let older = self.recent.len() - recent;
-        recent >= RESUME_MIN_EVENTS && recent as f32 >= RESUME_RATIO * older as f32
+        (recent >= RESUME_MIN_EVENTS && recent as f32 >= RESUME_RATIO * older as f32)
+            || self.steady_slow_stream()
+    }
+
+    /// Whether the gaps between the last `STEADY_GAPS + 1` reads look like a
+    /// finger moving slowly: sparse, and no longer in the later half than in
+    /// the earlier half. Reads rather than events, so a backlog a stalled
+    /// client spreads over its stall cannot pass for level gaps.
+    fn steady_slow_stream(&self) -> bool {
+        if self.reads.len() < STEADY_GAPS + 1
+            || self
+                .reads
+                .iter()
+                .any(|read| read.events > STEADY_READ_EVENTS)
+        {
+            return false;
+        }
+        let gaps = self
+            .reads
+            .iter()
+            .zip(self.reads.iter().skip(1))
+            .map(|(earlier, later)| later.at.duration_since(earlier.at).as_secs_f32())
+            .collect::<Vec<_>>();
+        let mut sorted = gaps.clone();
+        sorted.sort_by(f32::total_cmp);
+        if sorted[STEADY_GAPS / 2] < FAST_GAP.as_secs_f32() {
+            return false;
+        }
+        let (earlier, later) = gaps.split_at(STEADY_GAPS / 2);
+        let mean = |half: &[f32]| half.iter().sum::<f32>() / half.len() as f32;
+        mean(later) <= STEADY_GROWTH * mean(earlier)
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> TabSwipeTick {
@@ -575,6 +637,56 @@ mod tests {
         }
         assert_eq!(swipe.progress, 1.0);
         assert!(swipe.tick(at + TAB_SWIPE_IDLE).finished);
+    }
+
+    /// Gaps in milliseconds of the momentum tail after a fast trackpad swipe,
+    /// as Ghostty on macOS delivers it: one wheel event per cell of travel, so
+    /// the gaps step up in frame multiples as the scroll slows.
+    const MACOS_TAIL_GAPS: [u64; 17] = [
+        17, 17, 17, 17, 17, 17, 16, 17, 25, 25, 25, 24, 34, 33, 41, 67, 167,
+    ];
+
+    #[test]
+    fn a_slow_swipe_during_the_momentum_tail_starts_a_new_gesture() {
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        // The finger keeps moving for a while after the commit.
+        for _ in 0..40 {
+            at += Duration::from_millis(8);
+            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            swipe.tick(at);
+        }
+        // The whole tail on its own never restarts the gesture.
+        let mut tail_only = swipe.clone();
+        let mut t = at;
+        for gap in MACOS_TAIL_GAPS {
+            t += Duration::from_millis(gap);
+            assert_eq!(tail_only.push(1, neighbors(), t), TabSwipePush::Continue);
+            tail_only.tick(t);
+        }
+        // Fingers back down halfway through the tail, moving slowly the same way.
+        for gap in &MACOS_TAIL_GAPS[..10] {
+            at += Duration::from_millis(*gap);
+            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            swipe.tick(at);
+        }
+        let mut restarted_after = None;
+        for index in 1..=20 {
+            at += Duration::from_millis(30);
+            assert!(
+                !swipe.tick(at).finished,
+                "slow input keeps the gesture alive"
+            );
+            if swipe.push(1, neighbors(), at) == TabSwipePush::Restart {
+                restarted_after = Some(index);
+                break;
+            }
+        }
+        assert!(
+            matches!(restarted_after, Some(1..=12)),
+            "restarted after {restarted_after:?} slow events"
+        );
     }
 
     #[test]
