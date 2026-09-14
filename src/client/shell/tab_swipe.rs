@@ -43,7 +43,7 @@ const STEADY_READ_EVENTS: u32 = 2;
 
 /// A wheel-driven tab switch in progress. Wheel events carry no distance, so
 /// the gesture counts them and commits once one direction reaches the threshold.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct TabSwipe {
     pub(super) workspace_id: String,
     /// Tab that was focused when the swipe began.
@@ -63,6 +63,32 @@ pub(super) struct TabSwipe {
     /// Reads that carried events for this gesture, oldest first.
     reads: VecDeque<InputRead>,
     phase: TabSwipePhase,
+}
+
+/// Which neighbor a swipe is moving toward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TabSwipeDirection {
+    Previous,
+    Next,
+}
+
+impl TabSwipeDirection {
+    /// Sign of the step count moving this way: negative toward the previous
+    /// tab, positive toward the next.
+    pub(super) fn sign(self) -> i32 {
+        match self {
+            Self::Previous => -1,
+            Self::Next => 1,
+        }
+    }
+
+    fn of_steps(steps: i32) -> Option<Self> {
+        match steps.signum() {
+            -1 => Some(Self::Previous),
+            1 => Some(Self::Next),
+            _ => None,
+        }
+    }
 }
 
 /// The neighbor a swipe is moving toward.
@@ -99,8 +125,7 @@ enum TabSwipePhase {
 /// The moment a swipe reached the threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TabSwipeCommit {
-    /// Sign of the step count that committed.
-    direction: i32,
+    direction: TabSwipeDirection,
     at: Instant,
 }
 
@@ -136,7 +161,7 @@ pub(super) struct TabSwipeNeighbors<'a> {
 impl<'a> TabSwipeNeighbors<'a> {
     /// Neighbors of `tab_ids[origin]`. With two or more tabs the strip wraps,
     /// so both neighbors always exist; a lone tab has none.
-    pub(super) fn around(tab_ids: &'a [String], origin: usize) -> Self {
+    pub(super) fn around(tab_ids: &[&'a str], origin: usize) -> Self {
         let count = tab_ids.len();
         if count < 2 || origin >= count {
             return Self::default();
@@ -150,8 +175,8 @@ impl<'a> TabSwipeNeighbors<'a> {
         };
         let next = if next_wraps { 0 } else { origin + 1 };
         Self {
-            previous: tab_ids.get(previous).map(String::as_str),
-            next: tab_ids.get(next).map(String::as_str),
+            previous: tab_ids.get(previous).copied(),
+            next: tab_ids.get(next).copied(),
             previous_wraps,
             next_wraps,
         }
@@ -174,9 +199,9 @@ impl TabSwipe {
         }
     }
 
-    /// -1 toward the previous tab, 1 toward the next, 0 at rest.
-    pub(super) fn direction(&self) -> i32 {
-        self.steps.signum()
+    /// Which way the swipe is moving, or `None` while it is at rest.
+    pub(super) fn direction(&self) -> Option<TabSwipeDirection> {
+        TabSwipeDirection::of_steps(self.steps)
     }
 
     /// Feeds one wheel event. A direction without a neighbor makes no
@@ -184,7 +209,7 @@ impl TabSwipe {
     /// that neighbor.
     pub(super) fn push(
         &mut self,
-        delta: i32,
+        direction: TabSwipeDirection,
         neighbors: TabSwipeNeighbors<'_>,
         now: Instant,
     ) -> TabSwipePush {
@@ -202,15 +227,15 @@ impl TabSwipe {
             TabSwipePhase::Tracking => {}
             TabSwipePhase::SnappingBack { .. } => {
                 // Resume from wherever the snap-back animation currently is.
-                let sign = if self.steps < 0 { -1 } else { 1 };
-                self.steps = Self::steps_for_progress(self.progress) as i32 * sign;
+                let resumed = TabSwipeDirection::of_steps(self.steps).unwrap_or(direction);
+                self.steps = Self::steps_for_progress(self.progress) as i32 * resumed.sign();
                 self.phase = TabSwipePhase::Tracking;
             }
             TabSwipePhase::Landing { commit, .. } | TabSwipePhase::Cooldown { commit } => {
                 // A notch cannot be momentum: nothing coasts at wheel rates.
                 // It starts the next swipe at once, so a wheel keeps switching
                 // tabs for as long as it keeps turning.
-                if discrete_notch || self.fresh_swipe(delta, commit, now) {
+                if discrete_notch || self.fresh_swipe(direction, commit, now) {
                     return TabSwipePush::Restart;
                 }
                 return TabSwipePush::Continue;
@@ -219,9 +244,9 @@ impl TabSwipe {
         // A notch is a whole swipe. The first event of a gesture could still
         // be the start of a trackpad stream, so the second one commits.
         let mut steps = if discrete_notch {
-            delta.signum() * TAB_SWIPE_THRESHOLD as i32
+            direction.sign() * TAB_SWIPE_THRESHOLD as i32
         } else {
-            self.steps + delta.signum()
+            self.steps + direction.sign()
         };
         if neighbors.next.is_none() {
             steps = steps.min(0);
@@ -230,10 +255,10 @@ impl TabSwipe {
             steps = steps.max(0);
         }
         self.steps = steps;
-        let (neighbor, wraps) = match steps.signum() {
-            1 => (neighbors.next, neighbors.next_wraps),
-            -1 => (neighbors.previous, neighbors.previous_wraps),
-            _ => (None, false),
+        let (neighbor, wraps) = match TabSwipeDirection::of_steps(steps) {
+            Some(TabSwipeDirection::Next) => (neighbors.next, neighbors.next_wraps),
+            Some(TabSwipeDirection::Previous) => (neighbors.previous, neighbors.previous_wraps),
+            None => (None, false),
         };
         self.target = neighbor.map(|tab_id| TabSwipeTarget {
             tab_id: tab_id.to_owned(),
@@ -245,15 +270,16 @@ impl TabSwipe {
             return TabSwipePush::Continue;
         }
         // Steps only move toward a neighbor that exists, so a threshold-sized
-        // count always has a target.
-        let Some(target) = &self.target else {
+        // count always has a target and a direction.
+        let (Some(target), Some(committed)) = (&self.target, TabSwipeDirection::of_steps(steps))
+        else {
             return TabSwipePush::Continue;
         };
         self.phase = TabSwipePhase::Landing {
             from: self.progress,
             started: now,
             commit: TabSwipeCommit {
-                direction: steps.signum(),
+                direction: committed,
                 at: now,
             },
         };
@@ -318,11 +344,16 @@ impl TabSwipe {
     /// rather than the momentum tail of the one that committed: the fingers
     /// came back fast, or they have been moving slowly and steadily for a
     /// while, which a decaying tail never does.
-    fn fresh_swipe(&self, delta: i32, commit: TabSwipeCommit, now: Instant) -> bool {
+    fn fresh_swipe(
+        &self,
+        direction: TabSwipeDirection,
+        commit: TabSwipeCommit,
+        now: Instant,
+    ) -> bool {
         if now.duration_since(commit.at) < RESUME_MIN_AGE {
             return false;
         }
-        if delta.signum() != commit.direction {
+        if direction != commit.direction {
             return true;
         }
         let mut recent = 0usize;
@@ -441,6 +472,7 @@ impl TabSwipe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use TabSwipeDirection::{Next, Previous};
 
     fn neighbors() -> TabSwipeNeighbors<'static> {
         TabSwipeNeighbors {
@@ -461,13 +493,13 @@ mod tests {
     /// Pushes `count` events spaced like a trackpad, returning the last time.
     fn trackpad(
         swipe: &mut TabSwipe,
-        delta: i32,
+        direction: TabSwipeDirection,
         count: u32,
         mut at: Instant,
     ) -> (Instant, Vec<TabSwipePush>) {
         let mut results = Vec::new();
         for _ in 0..count {
-            results.push(swipe.push(delta, neighbors(), at));
+            results.push(swipe.push(direction, neighbors(), at));
             at += Duration::from_millis(4);
         }
         (at, results)
@@ -477,13 +509,13 @@ mod tests {
     fn commits_toward_next_after_threshold() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (_, results) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (_, results) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         let (last, rest) = results.split_last().expect("events");
         assert!(rest.iter().all(|result| *result == TabSwipePush::Continue));
         assert_eq!(*last, TabSwipePush::Commit("tab_next".into()));
         assert!(matches!(
             swipe.phase,
-            TabSwipePhase::Landing { commit, .. } if commit.direction == 1
+            TabSwipePhase::Landing { commit, .. } if commit.direction == Next
         ));
     }
 
@@ -491,11 +523,11 @@ mod tests {
     fn progress_tracks_the_event_count_past_the_dead_zone() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_DEAD_ZONE, now);
+        let (at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_DEAD_ZONE, now);
         assert_eq!(swipe.progress, 0.0, "the dead zone draws nothing");
         assert_eq!(target_id(&swipe), Some("tab_next"));
         let quarter = (TAB_SWIPE_THRESHOLD - TAB_SWIPE_DEAD_ZONE) / 4;
-        trackpad(&mut swipe, 1, quarter, at);
+        trackpad(&mut swipe, Next, quarter, at);
         assert!((swipe.progress - 0.25).abs() < 1e-6);
     }
 
@@ -503,7 +535,7 @@ mod tests {
     fn a_few_stray_events_finish_quietly_when_idle() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, 3, now);
+        let (at, _) = trackpad(&mut swipe, Next, 3, now);
         assert_eq!(swipe.progress, 0.0);
         let tick = swipe.tick(at + TAB_SWIPE_IDLE);
         assert!(tick.finished && !tick.repaint, "no snap-back to animate");
@@ -513,11 +545,11 @@ mod tests {
     fn reversing_direction_moves_the_fill_back_toward_the_origin() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_DEAD_ZONE + 2, now);
+        let (at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_DEAD_ZONE + 2, now);
         let before = swipe.progress;
-        let (at, _) = trackpad(&mut swipe, -1, 1, at);
+        let (at, _) = trackpad(&mut swipe, Previous, 1, at);
         assert!(swipe.progress > 0.0 && swipe.progress < before);
-        trackpad(&mut swipe, -1, TAB_SWIPE_DEAD_ZONE + 3, at);
+        trackpad(&mut swipe, Previous, TAB_SWIPE_DEAD_ZONE + 3, at);
         assert_eq!(target_id(&swipe), Some("tab_prev"));
     }
 
@@ -531,7 +563,7 @@ mod tests {
             ..TabSwipeNeighbors::default()
         };
         for _ in 0..TAB_SWIPE_THRESHOLD * 2 {
-            assert_eq!(swipe.push(-1, first_tab, now), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Previous, first_tab, now), TabSwipePush::Continue);
         }
         assert_eq!(swipe.progress, 0.0);
         assert_eq!(swipe.target, None);
@@ -548,19 +580,19 @@ mod tests {
             previous_wraps: true,
             next_wraps: false,
         };
-        swipe.push(-1, first_tab, now);
+        swipe.push(Previous, first_tab, now);
         assert_eq!(target_id(&swipe), Some("tab_last"));
-        assert_eq!(swipe.direction(), -1);
+        assert_eq!(swipe.direction(), Some(Previous));
         assert!(wraps(&swipe));
-        swipe.push(1, first_tab, now);
-        swipe.push(1, first_tab, now);
+        swipe.push(Next, first_tab, now);
+        swipe.push(Next, first_tab, now);
         assert_eq!(target_id(&swipe), Some("tab_second"));
         assert!(!wraps(&swipe));
     }
 
     #[test]
     fn neighbors_wrap_around_the_strip() {
-        let tabs = ["a", "b", "c"].map(String::from);
+        let tabs = ["a", "b", "c"];
         let first = TabSwipeNeighbors::around(&tabs, 0);
         assert_eq!((first.previous, first.next), (Some("c"), Some("b")));
         assert!(first.previous_wraps && !first.next_wraps);
@@ -571,10 +603,10 @@ mod tests {
         assert_eq!((last.previous, last.next), (Some("b"), Some("a")));
         assert!(!last.previous_wraps && last.next_wraps);
         // A lone tab has nowhere to go; a pair reaches its one neighbor either way.
-        let lone = ["a"].map(String::from);
+        let lone = ["a"];
         let lone = TabSwipeNeighbors::around(&lone, 0);
         assert_eq!((lone.previous, lone.next), (None, None));
-        let pair = ["a", "b"].map(String::from);
+        let pair = ["a", "b"];
         let pair = TabSwipeNeighbors::around(&pair, 0);
         assert_eq!((pair.previous, pair.next), (Some("b"), Some("b")));
         assert!(pair.previous_wraps && !pair.next_wraps);
@@ -584,7 +616,7 @@ mod tests {
     fn idle_before_threshold_snaps_back_and_finishes() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD / 3, now);
+        let (at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD / 3, now);
         assert_eq!(swipe.tick(at + TAB_SWIPE_IDLE / 2), TabSwipeTick::default());
         let idle_at = at + TAB_SWIPE_IDLE;
         assert!(!swipe.tick(idle_at).finished);
@@ -600,11 +632,11 @@ mod tests {
     fn momentum_tail_after_a_commit_is_swallowed() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         // Momentum: same direction, gaps growing from 8ms to 60ms over ~700ms.
         for gap in (8..=60).step_by(2) {
             at += Duration::from_millis(gap);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
         assert_eq!(swipe.progress, 1.0);
@@ -622,11 +654,11 @@ mod tests {
     fn a_slow_swipe_during_the_momentum_tail_starts_a_new_gesture() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         // The finger keeps moving for a while after the commit.
         for _ in 0..40 {
             at += Duration::from_millis(8);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
         // The whole tail on its own never restarts the gesture.
@@ -634,13 +666,13 @@ mod tests {
         let mut t = at;
         for gap in MACOS_TAIL_GAPS {
             t += Duration::from_millis(gap);
-            assert_eq!(tail_only.push(1, neighbors(), t), TabSwipePush::Continue);
+            assert_eq!(tail_only.push(Next, neighbors(), t), TabSwipePush::Continue);
             tail_only.tick(t);
         }
         // Fingers back down halfway through the tail, moving slowly the same way.
         for gap in &MACOS_TAIL_GAPS[..10] {
             at += Duration::from_millis(*gap);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
         let mut restarted_after = None;
@@ -650,7 +682,7 @@ mod tests {
                 !swipe.tick(at).finished,
                 "slow input keeps the gesture alive"
             );
-            if swipe.push(1, neighbors(), at) == TabSwipePush::Restart {
+            if swipe.push(Next, neighbors(), at) == TabSwipePush::Restart {
                 restarted_after = Some(index);
                 break;
             }
@@ -665,24 +697,30 @@ mod tests {
     fn a_reversed_swipe_after_a_commit_restarts() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
-        assert_eq!(swipe.push(-1, neighbors(), at), TabSwipePush::Continue);
+        let (at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
+        assert_eq!(
+            swipe.push(Previous, neighbors(), at),
+            TabSwipePush::Continue
+        );
         let later = at + RESUME_MIN_AGE;
-        assert_eq!(swipe.push(-1, neighbors(), later), TabSwipePush::Restart);
+        assert_eq!(
+            swipe.push(Previous, neighbors(), later),
+            TabSwipePush::Restart
+        );
     }
 
     #[test]
     fn a_faster_same_direction_burst_during_momentum_restarts() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         // Sparse momentum tail for 300ms.
         for _ in 0..10 {
             at += Duration::from_millis(30);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         }
         // Fingers come back: a dense burst.
-        let (_, results) = trackpad(&mut swipe, 1, 20, at + Duration::from_millis(4));
+        let (_, results) = trackpad(&mut swipe, Next, 20, at + Duration::from_millis(4));
         assert!(results.contains(&TabSwipePush::Restart));
     }
 
@@ -690,19 +728,19 @@ mod tests {
     fn a_second_swipe_whose_first_events_share_a_read_still_restarts() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         // Late momentum tail, with the gaps grown to 56ms.
         for gap in (8..=56).step_by(2) {
             at += Duration::from_millis(gap);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
         // Fingers come back 58ms later, and the client reads the first two
         // events of the new swipe together, so they share a timestamp.
         at += Duration::from_millis(58);
-        assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
-        assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
-        let (_, results) = trackpad(&mut swipe, 1, 20, at + Duration::from_millis(4));
+        assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
+        assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
+        let (_, results) = trackpad(&mut swipe, Next, 20, at + Duration::from_millis(4));
         assert!(results.contains(&TabSwipePush::Restart));
     }
 
@@ -710,18 +748,18 @@ mod tests {
     fn a_wheel_notch_commits_as_soon_as_it_can_be_told_from_a_swipe() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
+        assert_eq!(swipe.push(Next, neighbors(), now), TabSwipePush::Continue);
         let mut at = now + Duration::from_millis(80);
         assert_eq!(
-            swipe.push(1, neighbors(), at),
+            swipe.push(Next, neighbors(), at),
             TabSwipePush::Commit("tab_next".into())
         );
         // Later notches keep switching instead of being swallowed as momentum,
         // in either direction.
         at += Duration::from_millis(80);
-        assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Restart);
+        assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Restart);
         at += Duration::from_millis(80);
-        assert_eq!(swipe.push(-1, neighbors(), at), TabSwipePush::Restart);
+        assert_eq!(swipe.push(Previous, neighbors(), at), TabSwipePush::Restart);
     }
 
     #[test]
@@ -729,10 +767,10 @@ mod tests {
         // Two notches in one read share an instant, so their gap says nothing.
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
-        assert_eq!(swipe.push(1, neighbors(), now), TabSwipePush::Continue);
+        assert_eq!(swipe.push(Next, neighbors(), now), TabSwipePush::Continue);
+        assert_eq!(swipe.push(Next, neighbors(), now), TabSwipePush::Continue);
         assert_eq!(
-            swipe.push(1, neighbors(), now + Duration::from_millis(80)),
+            swipe.push(Next, neighbors(), now + Duration::from_millis(80)),
             TabSwipePush::Commit("tab_next".into())
         );
     }
@@ -741,23 +779,23 @@ mod tests {
     fn a_stalled_client_batching_the_momentum_tail_does_not_restart() {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
-        let (mut at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         // Momentum at 10ms gaps, processed on time.
         for _ in 0..16 {
             at += Duration::from_millis(10);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
         // The client stalls for 200ms, then processes the 20 tail events that
         // queued up meanwhile as one batch, all stamped with the same instant.
         at += Duration::from_millis(200);
         for _ in 0..20 {
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         }
         // The rest of the tail is processed on time again.
         for _ in 0..10 {
             at += Duration::from_millis(10);
-            assert_eq!(swipe.push(1, neighbors(), at), TabSwipePush::Continue);
+            assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         }
     }
 
@@ -766,7 +804,7 @@ mod tests {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
         assert_eq!(swipe.next_wake(now), now + TAB_SWIPE_IDLE);
-        let (at, _) = trackpad(&mut swipe, 1, TAB_SWIPE_THRESHOLD, now);
+        let (at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
         assert_eq!(swipe.next_wake(at), at + TAB_SWIPE_FRAME);
     }
 }

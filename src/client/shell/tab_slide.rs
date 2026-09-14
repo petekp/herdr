@@ -1,3 +1,4 @@
+use super::tab_swipe::TabSwipeDirection;
 use super::*;
 
 /// A tab next to the focused one, rendered at the pane area's size so its
@@ -20,8 +21,8 @@ pub(super) struct TabSlide<'a> {
     outgoing: Option<&'a FrameData>,
     /// Content of the tab the swipe is moving toward.
     incoming: Option<&'a FrameData>,
-    /// Sign of the swipe: positive moves the content left, toward the next tab.
-    direction: i32,
+    /// Which way the swipe is moving. Toward the next tab moves the content left.
+    direction: TabSwipeDirection,
     progress: f32,
 }
 
@@ -70,7 +71,7 @@ impl ClientShellState {
         Some(TabSlide {
             outgoing: frame_for(&swipe.origin_tab_id),
             incoming: frame_for(&target.tab_id),
-            direction: swipe.direction(),
+            direction: swipe.direction()?,
             progress: swipe.progress,
         })
     }
@@ -127,6 +128,16 @@ impl ClientShellState {
             return false;
         };
         if rendered != tab_id || self.tab_swipe.is_none() {
+            return false;
+        }
+        // Decoding allocates `cols * rows` cells up front, so a surface that
+        // does not fit the pane area is refused here rather than built and
+        // then discarded by `tab_slide`.
+        let fits_pane_area = self
+            .last_composed_size
+            .map(|(width, height)| self.layout(width, height).pane_surface)
+            .is_some_and(|area| area.width == cols && area.height == rows);
+        if !fits_pane_area {
             return false;
         }
         self.neighbor_surfaces
@@ -196,7 +207,7 @@ pub(super) fn compose_tab_slide(
 ) {
     let width = i32::from(area.width);
     let travel = width + i32::from(TAB_SLIDE_GAP);
-    let direction = if slide.direction < 0 { -1 } else { 1 };
+    let direction = slide.direction.sign();
     // Columns the content has moved so far.
     let offset = ((slide.progress.clamp(0.0, 1.0) * travel as f32).round() as i32).clamp(0, travel);
     let outgoing_shift = -direction * offset;
@@ -299,6 +310,7 @@ pub(super) fn blit_shifted(target: &mut FrameData, source: &FrameData, area: Rec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use TabSwipeDirection::{Next, Previous};
 
     fn frame(lines: &[&str]) -> FrameData {
         FrameData::from_ratatui_buffer_with_hyperlinks(
@@ -354,7 +366,7 @@ mod tests {
         let outgoing = frame(&["oooooo"]);
         let incoming = frame(&["nnnnnn"]);
         let palette = Palette::catppuccin();
-        let compose = |direction: i32, progress: f32| {
+        let compose = |direction: TabSwipeDirection, progress: f32| {
             let mut composed = frame(&["      "]);
             compose_tab_slide(
                 &mut composed,
@@ -370,15 +382,15 @@ mod tests {
             symbols(&composed).concat()
         };
 
-        assert_eq!(compose(1, 0.0), "oooooo");
+        assert_eq!(compose(Next, 0.0), "oooooo");
         assert_eq!(
-            compose(1, 0.5),
+            compose(Next, 0.5),
             "oo│nnn",
             "the seam follows the outgoing content out"
         );
-        assert_eq!(compose(1, 1.0), "nnnnnn");
+        assert_eq!(compose(Next, 1.0), "nnnnnn");
         assert_eq!(
-            compose(-1, 0.5),
+            compose(Previous, 0.5),
             "nnn│oo",
             "a swipe the other way enters from the left"
         );

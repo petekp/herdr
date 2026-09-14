@@ -971,6 +971,32 @@ fn a_swipe_asks_for_the_neighbor_surface_once() {
 }
 
 #[test]
+fn a_neighbor_surface_that_does_not_fit_the_pane_area_is_refused() {
+    let mut state = three_tab_state("tab_1");
+    let pane = state.hits.panes[0].inner_rect;
+    let outcome = wheel_at(&mut state, MouseEventKind::ScrollRight, pane.x, pane.y);
+    let request_id = endpoint_request_id(&outcome);
+    // Decoding allocates cols * rows cells, so an oversized answer must not
+    // reach the decoder.
+    let huge = crate::api::schema::ResponseResult::ClientShellSurface {
+        tab_id: "tab_2".into(),
+        cols: u16::MAX,
+        rows: u16::MAX,
+        lines: Vec::new(),
+    };
+    assert!(!state.receive_neighbor_surface("tab_2", Ok(huge)));
+    assert!(state.neighbor_surfaces.is_empty());
+
+    let area = state.layout(106, 20).pane_surface;
+    state.handle_endpoint_result(
+        "boot-1",
+        &request_id,
+        Ok(neighbor_surface_result("tab_2", area, "N")),
+    );
+    assert_eq!(state.neighbor_surfaces.len(), 1, "the right size is kept");
+}
+
+#[test]
 fn pane_content_slides_with_the_swipe_and_the_neighbor_fills_in() {
     let dead_zone = crate::client::shell::tab_swipe::TAB_SWIPE_DEAD_ZONE;
     let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;

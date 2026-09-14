@@ -1,3 +1,4 @@
+use super::super::tab_swipe::{TabSwipe, TabSwipeDirection};
 use super::*;
 
 const TAB_SCROLL_BUTTON_WIDTH: u16 = 3;
@@ -12,7 +13,7 @@ pub(crate) fn render_tab_bar(
     tab_scroll: &mut usize,
     reveal_focused_tab: &mut bool,
     tab_drag_insert_index: Option<usize>,
-    tab_swipe: Option<&super::super::tab_swipe::TabSwipe>,
+    tab_swipe: Option<&TabSwipe>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -278,7 +279,7 @@ const SWIPE_EDGE_BLOCKS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "�
 fn render_tab_swipe_fill(
     buffer: &mut Buffer,
     palette: &Palette,
-    swipe: &super::super::tab_swipe::TabSwipe,
+    swipe: &TabSwipe,
     (origin, origin_style): (Rect, Style),
     target: Option<Rect>,
 ) {
@@ -300,7 +301,7 @@ fn render_tab_swipe_fill(
         target => {
             let leaving = f32::from(origin.width) * (1.0 - progress);
             let entered = target.map_or(0.0, |target| f32::from(target.width) * progress);
-            if swipe.direction() < 0 {
+            if swipe.direction() == Some(TabSwipeDirection::Previous) {
                 [
                     Some((f32::from(origin.x), f32::from(origin.x) + leaving)),
                     target.map(|target| {
@@ -344,29 +345,40 @@ fn edge_style(fg: ratatui::style::Color, bg: ratatui::style::Color) -> Style {
 /// one row. Whole cells keep their text. The two edge cells use partial
 /// block glyphs so the fill moves in eighths of a cell.
 fn paint_fill_span(buffer: &mut Buffer, palette: &Palette, y: u16, start: f32, end: f32) {
-    if end <= start || end.floor() == start.floor() {
+    if end <= start {
         return;
     }
-    let mut x = start.ceil();
-    while x < end.floor() {
-        if let Some(cell) = buffer.cell_mut((x as u16, y)) {
+    // Clamped so the eighth count always indexes SWIPE_EDGE_BLOCKS.
+    let eighths = |fraction: f32| ((fraction * 8.0).round() as usize).min(8);
+    let (first, last) = (start.floor(), end.floor());
+    if first == last {
+        // Narrower than one cell: one partial block against whichever side of
+        // the cell the span sits closer to, so a fill this small still shows.
+        let accent_left = start - first <= first + 1.0 - end;
+        paint_split_cell(
+            buffer,
+            palette,
+            (first as u16, y),
+            eighths(end - start),
+            accent_left,
+        );
+        return;
+    }
+    for x in start.ceil() as u16..last as u16 {
+        if let Some(cell) = buffer.cell_mut((x, y)) {
             cell.set_style(filled_style(palette));
         }
-        x += 1.0;
     }
-    let eighths = |fraction: f32| (fraction * 8.0).round() as usize;
     // Leading edge: the accent covers the right part of the cell.
-    let leading = (start.floor() as u16, y);
     paint_split_cell(
         buffer,
         palette,
-        leading,
-        8 - eighths(start - start.floor()),
+        (first as u16, y),
+        8 - eighths(start - first),
         false,
     );
     // Trailing edge: the accent covers the left part of the cell.
-    let trailing = (end.floor() as u16, y);
-    paint_split_cell(buffer, palette, trailing, eighths(end - end.floor()), true);
+    paint_split_cell(buffer, palette, (last as u16, y), eighths(end - last), true);
 }
 
 /// Paints an edge cell with `accent_eighths` of its width in the focused

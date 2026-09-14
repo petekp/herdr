@@ -62,7 +62,7 @@ impl WheelAxis {
 /// platforms lock a scroll gesture to one direction. Fingers drift, so
 /// without the lock a vertical scroll would nudge the tab swipe and a swipe
 /// would scroll the pane.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) struct WheelAxisLock {
     axis: WheelAxis,
     last_event: Instant,

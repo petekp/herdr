@@ -453,42 +453,44 @@ impl ClientShellState {
     /// Feeds one wheel event over the tab strip into the swipe gesture.
     fn push_tab_swipe(
         &mut self,
-        delta: i32,
+        direction: super::tab_swipe::TabSwipeDirection,
         now: std::time::Instant,
         outcome: &mut ClientShellInput,
     ) {
-        let Some(snapshot) = self.snapshot.as_deref() else {
-            return;
+        let mut origin = match (self.tab_swipe.as_ref(), self.snapshot.as_deref()) {
+            (Some(swipe), _) => Some(swipe.origin_tab_id.clone()),
+            (None, Some(snapshot)) => snapshot.focused_tab_id.clone(),
+            (None, None) => return,
         };
-        let Some(workspace_id) = snapshot.focused_workspace_id.clone() else {
-            return;
-        };
-        let tab_ids = snapshot
-            .tabs
-            .iter()
-            .filter(|tab| tab.workspace_id == workspace_id)
-            .map(|tab| tab.tab_id.clone())
-            .collect::<Vec<_>>();
-        let mut origin = self
-            .tab_swipe
-            .as_ref()
-            .map(|swipe| swipe.origin_tab_id.clone())
-            .or_else(|| snapshot.focused_tab_id.clone());
         // A restart replays the event into a new gesture, so at most two passes.
         for _ in 0..2 {
+            let Some(snapshot) = self.snapshot.as_deref() else {
+                return;
+            };
+            let Some(workspace_id) = snapshot.focused_workspace_id.as_deref() else {
+                return;
+            };
             let Some(origin_id) = origin.take() else {
                 return;
             };
+            // Borrowed from the snapshot: a dense swipe pushes an event per
+            // wheel report, so the strip is not copied for each one.
+            let tab_ids = snapshot
+                .tabs
+                .iter()
+                .filter(|tab| tab.workspace_id == workspace_id)
+                .map(|tab| tab.tab_id.as_str())
+                .collect::<Vec<_>>();
             let Some(origin_index) = tab_ids.iter().position(|tab_id| *tab_id == origin_id) else {
                 self.tab_swipe = None;
                 return;
             };
             let neighbors = super::tab_swipe::TabSwipeNeighbors::around(&tab_ids, origin_index);
             let swipe = self.tab_swipe.get_or_insert_with(|| {
-                super::tab_swipe::TabSwipe::begin(workspace_id.clone(), origin_id, now)
+                super::tab_swipe::TabSwipe::begin(workspace_id.to_owned(), origin_id, now)
             });
             let before = swipe.progress;
-            let push = swipe.push(delta, neighbors, now);
+            let push = swipe.push(direction, neighbors, now);
             let moved = swipe.progress != before;
             let target = swipe.target.as_ref().map(|target| target.tab_id.clone());
             match push {
@@ -1893,11 +1895,13 @@ impl ClientShellState {
                 if !self.admit_wheel_axis(mouse.kind, now) {
                     return;
                 }
-                let delta = match mouse.kind {
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => -1,
-                    _ => 1,
+                let direction = match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => {
+                        super::tab_swipe::TabSwipeDirection::Previous
+                    }
+                    _ => super::tab_swipe::TabSwipeDirection::Next,
                 };
-                self.push_tab_swipe(delta, now, outcome);
+                self.push_tab_swipe(direction, now, outcome);
             }
             MouseEventKind::ScrollUp if super::contains(self.hits.agent_body, point) => {
                 let next = self.agent_scroll.saturating_sub(1);
