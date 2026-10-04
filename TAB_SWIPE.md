@@ -8,6 +8,29 @@ with it. Past either end, the strip wraps around.
 These instructions are written for a coding agent to follow. Paste the link to
 this file into your agent and ask it to install the tab swipe build.
 
+## Input devices
+
+The swipe reads horizontal wheel events from your terminal, so it works with
+whatever your terminal turns into those.
+
+- Trackpads: a two-finger horizontal swipe. Built and tuned on a MacBook
+  trackpad in Ghostty, including the momentum after you lift your fingers. A
+  Magic Trackpad sends the same input.
+- Magic Mouse: a sideways swipe on its surface arrives like a trackpad swipe.
+  Not measured.
+- Mice with a tilt wheel or a thumb wheel: the second tilt or notch switches a
+  tab. A free-spinning thumb wheel sends a dense stream instead, which counts
+  like a trackpad: about 48 events per switch.
+- Any mouse over the tab row: a vertical wheel there swipes too, up for the
+  previous tab and down for the next. Over a pane, a vertical wheel scrolls
+  the pane as before.
+
+Your terminal must report horizontal wheel events in SGR mouse mode. Ghostty
+does. Without that, you keep the vertical wheel over the tab row. Herdr's
+mouse capture, `ui.mouse_capture`, must be on, which is the default. The
+timing is tuned to macOS trackpad event rates; Linux trackpads report at
+other rates and have not been tried.
+
 ## What you need
 
 - A direct Herdr install, the kind `curl -fsSL https://herdr.dev/install.sh | sh`
