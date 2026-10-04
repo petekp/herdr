@@ -8,7 +8,6 @@ use crossterm::event::MouseEventKind;
 const DENSE_GAP: Duration = Duration::from_millis(20);
 /// Gap at or above which a wheel event is a discrete notch, a momentum tail,
 /// or a slow deliberate scroll rather than part of a dense trackpad stream.
-/// Nothing drifts at these rates, so such events bypass the axis lock.
 const SPARSE_GAP: Duration = Duration::from_millis(40);
 /// Quiet time after which the next wheel event starts a new gesture on its
 /// own axis, whatever the previous gesture was doing.
@@ -58,15 +57,16 @@ impl WheelAxis {
     }
 }
 
-/// The axis a dense wheel stream currently belongs to, the way touch
-/// platforms lock a scroll gesture to one direction. Fingers drift, so
+/// The axis a wheel gesture currently belongs to, the way touch platforms
+/// lock a scroll gesture to one direction. Fingers drift at every pace, from
+/// a dense flick to a slow deliberate scroll and its momentum tail, so
 /// without the lock a vertical scroll would nudge the tab swipe and a swipe
-/// would scroll the pane.
+/// would scroll the pane. Only a quiet gap or a takeover frees the other axis.
 #[derive(Debug)]
 pub(super) struct WheelAxisLock {
     axis: WheelAxis,
     last_event: Instant,
-    /// Axes of the last `TAKEOVER_RUN` dense events, oldest first.
+    /// Axes of the last `TAKEOVER_RUN` events, oldest first.
     recent: VecDeque<WheelAxis>,
 }
 
@@ -86,9 +86,6 @@ impl WheelAxisLock {
         if gap >= WHEEL_QUIET_GAP {
             current.axis = axis;
             current.recent = VecDeque::from([axis]);
-            return true;
-        }
-        if WheelPace::of(gap) == WheelPace::Sparse {
             return true;
         }
         current.recent.push_back(axis);
@@ -192,11 +189,12 @@ mod tests {
     }
 
     #[test]
-    fn sparse_notches_bypass_the_lock() {
+    fn a_slow_scroll_keeps_its_axis_too() {
         let mut lock = None;
-        // Wheel notches: vertical, then a horizontal tilt without a pause.
+        // Slow scrolls and momentum tails arrive at notch rates and still
+        // drift, so only a pause frees the other axis.
         let admitted = feed(&mut lock, &[(0, V), (80, V), (80, H), (80, H)]);
-        assert_eq!(admitted, [true, true, true, true]);
+        assert_eq!(admitted, [true, true, false, false]);
     }
 
     #[test]

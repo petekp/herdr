@@ -706,6 +706,30 @@ fn a_wheel_notch_over_the_tab_row_switches_on_its_second_click() {
 }
 
 #[test]
+fn a_vertical_scroll_with_sideways_drift_over_a_pane_never_switches_tabs() {
+    // A finger scrolling down also emits the odd horizontal event, spaced at
+    // notch rates. Starting on one of those must not turn the scroll into a
+    // tilt wheel, and the scroll takes the gesture over within a few events.
+    let mut state = claude_code_pane_state();
+    let pane = state.hits.panes[0].inner_rect;
+    let point = (pane.x, pane.y);
+    let mut at = std::time::Instant::now();
+    use MouseEventKind::{ScrollDown as Down, ScrollRight as Right};
+    for kind in [
+        Right, Down, Down, Down, Down, Right, Down, Right, Down, Down,
+    ] {
+        at += std::time::Duration::from_millis(50);
+        let outcome = wheel_at_instant(&mut state, kind, point, at);
+        assert_eq!(
+            focused_tab_request(&outcome),
+            None,
+            "{kind:?} switched tabs"
+        );
+    }
+    assert!(state.tab_swipe.is_none(), "the scroll released the swipe");
+}
+
+#[test]
 fn wrapping_swipe_drains_the_origin_and_fills_the_far_tab_from_its_edge() {
     let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
     let mut state = three_tab_state("tab_1");

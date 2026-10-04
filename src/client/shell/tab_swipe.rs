@@ -60,6 +60,9 @@ pub(super) struct TabSwipe {
     last_input: Instant,
     last_event: Option<Instant>,
     dense_events: u32,
+    /// A vertical wheel event arrived while this swipe was alive. A wheel
+    /// tilts or scrolls, never both at once, so this rules out the notch path.
+    saw_vertical: bool,
     /// Reads that carried events for this gesture, oldest first.
     reads: VecDeque<InputRead>,
     phase: TabSwipePhase,
@@ -194,6 +197,7 @@ impl TabSwipe {
             last_input: now,
             last_event: None,
             dense_events: 0,
+            saw_vertical: false,
             reads: VecDeque::new(),
             phase: TabSwipePhase::Tracking,
         }
@@ -202,6 +206,30 @@ impl TabSwipe {
     /// Which way the swipe is moving, or `None` while it is at rest.
     pub(super) fn direction(&self) -> Option<TabSwipeDirection> {
         TabSwipeDirection::of_steps(self.steps)
+    }
+
+    /// Records a vertical wheel event arriving while this swipe is alive.
+    pub(super) fn note_vertical(&mut self) {
+        self.saw_vertical = true;
+    }
+
+    /// Ends a tracking swipe the way the idle timer would: a fill that moved
+    /// slides back, one still in the dead zone is finished at once.
+    pub(super) fn release(&mut self, now: Instant) -> TabSwipeTick {
+        if self.phase != TabSwipePhase::Tracking {
+            return TabSwipeTick::default();
+        }
+        if self.progress == 0.0 {
+            return TabSwipeTick {
+                repaint: false,
+                finished: true,
+            };
+        }
+        self.phase = TabSwipePhase::SnappingBack {
+            from: self.progress,
+            started: now,
+        };
+        TabSwipeTick::default()
     }
 
     /// Feeds one wheel event. A direction without a neighbor makes no
@@ -221,8 +249,10 @@ impl TabSwipe {
             self.dense_events += 1;
         }
         // A sparse gap means a notch, unless this gesture has already shown
-        // itself to be a trackpad, where it is a momentum tail thinning out.
-        let discrete_notch = !self.trackpad_input() && pace == Some(WheelPace::Sparse);
+        // itself to be a trackpad, where it is a momentum tail thinning out,
+        // or vertical events came in between, which only a finger produces.
+        let discrete_notch =
+            !self.trackpad_input() && !self.saw_vertical && pace == Some(WheelPace::Sparse);
         match self.phase {
             TabSwipePhase::Tracking => {}
             TabSwipePhase::SnappingBack { .. } => {
@@ -400,17 +430,7 @@ impl TabSwipe {
     pub(super) fn tick(&mut self, now: Instant) -> TabSwipeTick {
         let idle = now.duration_since(self.last_input) >= TAB_SWIPE_IDLE;
         match self.phase {
-            TabSwipePhase::Tracking if idle && self.progress == 0.0 => TabSwipeTick {
-                repaint: false,
-                finished: true,
-            },
-            TabSwipePhase::Tracking if idle => {
-                self.phase = TabSwipePhase::SnappingBack {
-                    from: self.progress,
-                    started: now,
-                };
-                TabSwipeTick::default()
-            }
+            TabSwipePhase::Tracking if idle => self.release(now),
             TabSwipePhase::Tracking => TabSwipeTick::default(),
             TabSwipePhase::SnappingBack { from, started } => {
                 let (repaint, arrived) = self.settle(from, 0.0, started, now);
@@ -773,6 +793,19 @@ mod tests {
             swipe.push(Next, neighbors(), now + Duration::from_millis(80)),
             TabSwipePush::Commit("tab_next".into())
         );
+    }
+
+    #[test]
+    fn a_notch_pair_with_a_vertical_event_between_is_drift_not_a_wheel() {
+        let now = Instant::now();
+        let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
+        assert_eq!(swipe.push(Next, neighbors(), now), TabSwipePush::Continue);
+        swipe.note_vertical();
+        assert_eq!(
+            swipe.push(Next, neighbors(), now + Duration::from_millis(80)),
+            TabSwipePush::Continue
+        );
+        assert_eq!(swipe.steps, 2);
     }
 
     #[test]

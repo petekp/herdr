@@ -1906,6 +1906,18 @@ impl ClientShellState {
         self.neighbor_surfaces.clear();
     }
 
+    /// Ends a swipe in progress the way its idle timer would.
+    pub(super) fn release_tab_swipe(&mut self, now: std::time::Instant) -> bool {
+        let Some(swipe) = self.tab_swipe.as_mut() else {
+            return false;
+        };
+        let released = swipe.release(now);
+        if released.finished {
+            self.end_tab_swipe();
+        }
+        released.repaint
+    }
+
     pub(crate) fn tick_tab_swipe(&mut self, now: std::time::Instant) -> bool {
         let Some(swipe) = self.tab_swipe.as_mut() else {
             return false;

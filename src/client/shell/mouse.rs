@@ -2402,10 +2402,18 @@ impl ClientShellState {
                     .find(|hit| super::contains(hit.inner_rect, point))
                     .cloned()
                 {
-                    if self.pane_drops_horizontal_wheel(&hit)
-                        && !self.admit_wheel_axis(mouse.kind, now)
-                    {
-                        return;
+                    if self.pane_drops_horizontal_wheel(&hit) {
+                        // Only vertical wheel gets this far: horizontal wheel
+                        // over such a pane went to the swipe arm above.
+                        if let Some(swipe) = self.tab_swipe.as_mut() {
+                            swipe.note_vertical();
+                        }
+                        if !self.admit_wheel_axis(mouse.kind, now) {
+                            return;
+                        }
+                        // The lock calls this gesture a scroll, so a swipe
+                        // that sideways drift started lets go.
+                        outcome.repaint |= self.release_tab_swipe(now);
                     }
                     if self.focused_pane_id().as_deref() != Some(hit.pane_id.as_str()) {
                         self.push_endpoint_method(
