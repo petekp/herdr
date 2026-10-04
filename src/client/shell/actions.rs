@@ -507,6 +507,9 @@ impl ClientShellState {
         {
             return (false, Vec::new());
         }
+        if let PendingEndpointKind::NeighborSurface { tab_id } = &pending.kind {
+            return (self.receive_neighbor_surface(tab_id, result), Vec::new());
+        }
         if let PendingEndpointKind::PaneLinkResolve { target } = pending.kind {
             return self.complete_link_hover(target, result);
         }

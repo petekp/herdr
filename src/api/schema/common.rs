@@ -67,6 +67,17 @@ pub struct ClientShellSurfaceSetParams {
     pub active: bool,
 }
 
+/// Consecutive cells of one rendered surface row that share a style. Colors
+/// and modifiers use the same packed values as pane surface cells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ClientShellSurfaceRun {
+    /// One symbol per cell; the cell after a wide glyph is its blank tail.
+    pub cells: Vec<String>,
+    pub fg: u32,
+    pub bg: u32,
+    pub modifier: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
