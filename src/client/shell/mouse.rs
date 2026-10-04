@@ -4,9 +4,6 @@ use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 const SELECTION_AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
 const SELECTION_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
-/// Agents that report the mouse but never act on horizontal wheel.
-const AGENTS_DROPPING_HORIZONTAL_WHEEL: &[&str] = &["claude", "omp"];
-
 impl ClientShellState {
     fn set_sidebar_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
         let (min, max) = crate::config::validated_sidebar_bounds(
@@ -454,41 +451,35 @@ impl ClientShellState {
     }
 
     /// Whether a wheel event at `point` drives the tab swipe: any wheel on the
-    /// tab row, or a horizontal wheel over a pane whose app would drop it.
+    /// tab row, or a horizontal wheel over a pane while the config allows it.
     fn wheel_swipes_tabs(&self, kind: MouseEventKind, point: (u16, u16)) -> bool {
+        if !self.config.tab_swipe {
+            return false;
+        }
         if super::contains(self.hits.tab_bar, point) {
             return true;
         }
-        matches!(
-            kind,
-            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
-        ) && self.hits.panes.iter().any(|hit| {
-            super::contains(hit.inner_rect, point) && self.pane_drops_horizontal_wheel(hit)
-        })
+        self.swipe_takes_pane_wheel()
+            && matches!(
+                kind,
+                MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+            )
+            && self
+                .hits
+                .panes
+                .iter()
+                .any(|hit| super::contains(hit.inner_rect, point))
     }
 
-    /// Whether the pane's app would ignore a horizontal wheel event, so Herdr
-    /// can spend it on the tab swipe. An app that is not reporting the mouse
-    /// never sees wheel events, and Claude Code's fullscreen renderer tracks
-    /// the mouse only to scroll its own transcript.
-    fn pane_drops_horizontal_wheel(&self, hit: &PaneHit) -> bool {
-        if !hit.mouse_reporting {
-            return true;
-        }
-        self.snapshot.as_deref().is_some_and(|snapshot| {
-            snapshot.agents.iter().any(|agent| {
-                agent.pane_id == hit.pane_id
-                    && agent
-                        .agent
-                        .as_deref()
-                        .is_some_and(|agent| AGENTS_DROPPING_HORIZONTAL_WHEEL.contains(&agent))
-            })
-        })
+    /// Whether horizontal wheel over a pane goes to the swipe rather than to
+    /// the pane's program.
+    fn swipe_takes_pane_wheel(&self) -> bool {
+        self.config.tab_swipe && self.config.tab_swipe_over_panes
     }
 
-    /// Whether a wheel event is on the axis its burst started on. Applied
-    /// wherever Herdr spends horizontal wheel on the swipe; other apps that
-    /// report the mouse get every event.
+    /// Whether a wheel event is on the axis its burst started on. Applied to
+    /// every pane while the swipe takes horizontal wheel over panes; with
+    /// that off, panes get every event.
     fn admit_wheel_axis(&mut self, kind: MouseEventKind, now: std::time::Instant) -> bool {
         match super::wheel_axis::WheelAxis::of(kind) {
             Some(axis) => super::wheel_axis::WheelAxisLock::admit(&mut self.wheel_axis, axis, now),
@@ -2402,9 +2393,9 @@ impl ClientShellState {
                     .find(|hit| super::contains(hit.inner_rect, point))
                     .cloned()
                 {
-                    if self.pane_drops_horizontal_wheel(&hit) {
+                    if self.swipe_takes_pane_wheel() {
                         // Only vertical wheel gets this far: horizontal wheel
-                        // over such a pane went to the swipe arm above.
+                        // over a pane went to the swipe arm above.
                         if let Some(swipe) = self.tab_swipe.as_mut() {
                             swipe.note_vertical();
                         }

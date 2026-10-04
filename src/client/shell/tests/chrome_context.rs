@@ -710,7 +710,7 @@ fn a_vertical_scroll_with_sideways_drift_over_a_pane_never_switches_tabs() {
     // A finger scrolling down also emits the odd horizontal event, spaced at
     // notch rates. Starting on one of those must not turn the scroll into a
     // tilt wheel, and the scroll takes the gesture over within a few events.
-    let mut state = claude_code_pane_state();
+    let mut state = mouse_reporting_pane_state();
     let pane = state.hits.panes[0].inner_rect;
     let point = (pane.x, pane.y);
     let mut at = std::time::Instant::now();
@@ -946,48 +946,41 @@ fn horizontal_wheel_over_a_pane_swipes_tabs_instead_of_reaching_the_pane() {
 }
 
 #[test]
-fn horizontal_wheel_over_a_mouse_reporting_pane_reaches_the_pane() {
-    let mut state = three_tab_state("tab_1");
-    let mut pane_surface = surface();
-    pane_surface.panes[0].mouse_reporting = true;
-    state.set_pane_surface(pane_surface);
-    state.compose(106, 20).expect("mouse-reporting pane");
+fn with_swipe_over_panes_off_horizontal_wheel_reaches_the_pane() {
+    let mut state = mouse_reporting_pane_state();
+    state.config.tab_swipe_over_panes = false;
     let pane = state.hits.panes[0].inner_rect;
     let outcome = wheel_at(&mut state, MouseEventKind::ScrollRight, pane.x, pane.y);
     assert!(state.tab_swipe.is_none());
     assert_eq!(pane_input_requests(&outcome), 1);
 }
 
-/// A pane running Claude Code with mouse reporting on.
-fn claude_code_pane_state() -> ClientShellState {
-    let mut state = three_tab_state_with("tab_1", |snapshot| {
-        snapshot.agents.push(ClientShellAgent {
-            pane_id: "pane_1".into(),
-            workspace_id: "ws_1".into(),
-            tab_id: "tab_1".into(),
-            name: None,
-            display_agent: Some("Claude Code".into()),
-            agent: Some("claude".into()),
-            title: None,
-            terminal_title: None,
-            terminal_title_stripped: None,
-            agent_status: AgentStatus::Idle,
-            state_change_seq: 0,
-            state_labels: Vec::new(),
-            tokens: Vec::new(),
-            focused: true,
-        });
-    });
+#[test]
+fn with_tab_swipe_off_wheel_over_the_tab_row_does_nothing() {
+    let mut state = three_tab_state("tab_1");
+    state.config.tab_swipe = false;
+    let outcome = wheel_over_tab(
+        &mut state,
+        MouseEventKind::ScrollRight,
+        crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD,
+    );
+    assert!(state.tab_swipe.is_none());
+    assert_eq!(focused_tab_request(&outcome), None);
+}
+
+/// A pane whose program reports the mouse.
+fn mouse_reporting_pane_state() -> ClientShellState {
+    let mut state = three_tab_state("tab_1");
     let mut pane_surface = surface();
     pane_surface.panes[0].mouse_reporting = true;
     state.set_pane_surface(pane_surface);
-    state.compose(106, 20).expect("claude code pane");
+    state.compose(106, 20).expect("mouse-reporting pane");
     state
 }
 
 #[test]
-fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
-    let mut state = claude_code_pane_state();
+fn horizontal_wheel_over_a_pane_swipes_even_when_it_reports_the_mouse() {
+    let mut state = mouse_reporting_pane_state();
     let pane = state.hits.panes[0].inner_rect;
     let sideways = wheel_at(&mut state, MouseEventKind::ScrollRight, pane.x, pane.y);
     assert!(
@@ -996,13 +989,13 @@ fn horizontal_wheel_over_claude_code_swipes_even_though_it_reports_the_mouse() {
     );
     assert_eq!(pane_input_requests(&sideways), 0);
 
-    let mut state = claude_code_pane_state();
+    let mut state = mouse_reporting_pane_state();
     let vertical = wheel_at(&mut state, MouseEventKind::ScrollDown, pane.x, pane.y);
     assert!(state.tab_swipe.is_none());
     assert_eq!(
         pane_input_requests(&vertical),
         1,
-        "vertical wheel still scrolls its transcript"
+        "vertical wheel still reaches the pane"
     );
 }
 

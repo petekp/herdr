@@ -1010,6 +1010,18 @@
           ]
         },
         {
+          "key": "ui.tab_swipe",
+          "type": "boolean",
+          "default": "true",
+          "description": "Switch tabs with a horizontal trackpad swipe or mouse wheel on the tab row. The focused tab's highlight and the pane content slide toward the neighbor as you swipe."
+        },
+        {
+          "key": "ui.tab_swipe_over_panes",
+          "type": "boolean",
+          "default": "true",
+          "description": "Let a horizontal wheel over a pane swipe tabs instead of reaching the pane's program. Turn off to keep sideways scrolling for programs that use it."
+        },
+        {
           "key": "ui.tab_bar_right",
           "type": "array",
           "default": "[]",
