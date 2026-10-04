@@ -10,6 +10,21 @@ pub fn build_id() -> Option<&'static str> {
     non_empty(option_env!("HERDR_BUILD_ID"))
 }
 
+/// Name of a downstream build variant, set at build time through
+/// `HERDR_BUILD_VARIANT`. Stock builds have none. The version label is left
+/// alone so release notes, announcements, and handoff checks match stock.
+pub fn variant() -> Option<&'static str> {
+    non_empty(option_env!("HERDR_BUILD_VARIANT"))
+}
+
+/// The version as shown to people, with the variant when there is one.
+pub fn display_version() -> String {
+    match variant() {
+        Some(variant) => format!("{} ({variant})", version()),
+        None => version(),
+    }
+}
+
 pub fn version() -> String {
     match channel() {
         "stable" => BASE_VERSION.to_string(),

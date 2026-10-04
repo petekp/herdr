@@ -1,5 +1,10 @@
 # herdr
 
+> **Tab swipe build.** This branch adds switching tabs with a trackpad swipe
+> or horizontal mouse wheel. [TAB_SWIPE.md](TAB_SWIPE.md) has the install
+> steps, written for your coding agent. Everything else is Herdr as released.
+
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />

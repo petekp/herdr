@@ -92,7 +92,7 @@ fn print_full_status(json: bool) -> std::io::Result<i32> {
     }
 
     println!("client:");
-    println!("  version: {}", crate::build_info::version());
+    println!("  version: {}", crate::build_info::display_version());
     println!(
         "  channel: {}",
         crate::config::Config::load().config.update.channel.as_str()
