@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::agents::AgentInfo;
-use super::common::{ClientWindowTitleReason, NotificationShowReason};
+use super::common::{ClientShellSurfaceRun, ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::integrations::{
     IntegrationInstallResult, IntegrationTarget, IntegrationUninstallResult,
@@ -300,6 +300,15 @@ pub enum ResponseResult {
     ClientShellSurfaceSet {
         active: bool,
         projection_revision: u64,
+    },
+    /// One tab's pane surface rendered at the requesting client shell's size
+    /// without focusing it.
+    ClientShellSurface {
+        tab_id: String,
+        cols: u16,
+        rows: u16,
+        /// One entry per row.
+        lines: Vec<Vec<ClientShellSurfaceRun>>,
     },
     Ok {},
 }

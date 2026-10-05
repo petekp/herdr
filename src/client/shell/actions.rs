@@ -532,6 +532,9 @@ impl ClientShellState {
         {
             return (false, Vec::new());
         }
+        if let PendingEndpointKind::NeighborSurface { tab_id } = &pending.kind {
+            return (self.receive_neighbor_surface(tab_id, result), Vec::new());
+        }
         if result.is_ok() {
             let timeout_key = ClientEndpointNoticeKey {
                 boot_id: boot_id.to_owned(),

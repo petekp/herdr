@@ -4958,6 +4958,22 @@
         {
           "properties": {
             "method": {
+              "const": "client_shell.surface.read",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/TabTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "session.snapshot",
               "type": "string"
             },
@@ -6832,6 +6848,41 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "ClientShellSurfaceRun": {
+          "description": "Consecutive cells of one rendered surface row that share a style. Colors\nand modifiers use the same packed values as pane surface cells.",
+          "properties": {
+            "bg": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cells": {
+              "description": "One symbol per cell; the cell after a wide glyph is its blank tail.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "fg": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "modifier": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "cells",
+            "fg",
+            "bg",
+            "modifier"
+          ],
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [
@@ -10506,6 +10557,48 @@
                 "type",
                 "active",
                 "projection_revision"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "One tab's pane surface rendered at the requesting client shell's size\nwithout focusing it.",
+              "properties": {
+                "cols": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "lines": {
+                  "description": "One entry per row.",
+                  "items": {
+                    "items": {
+                      "$ref": "#/schemas/success_response/$defs/ClientShellSurfaceRun"
+                    },
+                    "type": "array"
+                  },
+                  "type": "array"
+                },
+                "rows": {
+                  "format": "uint16",
+                  "maximum": 65535,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "client_shell_surface",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "cols",
+                "rows",
+                "lines"
               ],
               "type": "object"
             },

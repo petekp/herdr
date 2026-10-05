@@ -243,6 +243,38 @@ pub(super) fn snapshot(
     }
 }
 
+/// Groups each row of a rendered surface into runs of cells that share a
+/// style, the shape `client_shell.surface.read` returns.
+pub(crate) fn surface_lines(
+    frame: &FrameData,
+) -> Vec<Vec<crate::api::schema::ClientShellSurfaceRun>> {
+    frame
+        .cells
+        .chunks(usize::from(frame.width).max(1))
+        .map(|row| {
+            let mut runs: Vec<crate::api::schema::ClientShellSurfaceRun> = Vec::new();
+            for cell in row {
+                match runs.last_mut() {
+                    Some(run)
+                        if run.fg == cell.fg
+                            && run.bg == cell.bg
+                            && run.modifier == cell.modifier =>
+                    {
+                        run.cells.push(cell.symbol.clone());
+                    }
+                    _ => runs.push(crate::api::schema::ClientShellSurfaceRun {
+                        cells: vec![cell.symbol.clone()],
+                        fg: cell.fg,
+                        bg: cell.bg,
+                        modifier: cell.modifier,
+                    }),
+                }
+            }
+            runs
+        })
+        .collect()
+}
+
 pub(super) struct RenderedPaneSurface {
     pub(super) frame: FrameData,
     pub(super) panes: Vec<protocol::PaneSurfacePane>,

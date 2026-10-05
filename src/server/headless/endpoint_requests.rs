@@ -55,6 +55,25 @@ impl HeadlessServer {
             );
             return changed;
         }
+        if let api::schema::Method::ClientShellSurfaceRead(target) = &request.method {
+            let tab_id = target.tab_id.clone();
+            let (message, changed) = match self.read_client_shell_surface(client_id, &tab_id) {
+                Ok((result, changed)) => (
+                    crate::server::client_commands::success_message_with_result(
+                        boot_id, request_id, result,
+                    ),
+                    changed,
+                ),
+                Err((code, message)) => (
+                    crate::server::client_commands::error_message(
+                        boot_id, request_id, code, message,
+                    ),
+                    false,
+                ),
+            };
+            self.send_to_client(client_id, message);
+            return changed;
+        }
         if client.shell_endpoint_command_in_flight {
             let message = crate::server::client_commands::error_message(
                 boot_id,
@@ -126,5 +145,58 @@ impl HeadlessServer {
                     stream_active: None,
                 },
             )
+    }
+
+    /// Renders `tab_id` once at the requesting client's surface size without
+    /// focusing it. Returns whether another client now needs a full render.
+    fn read_client_shell_surface(
+        &mut self,
+        client_id: u64,
+        tab_id: &str,
+    ) -> Result<(api::schema::ResponseResult, bool), (&'static str, String)> {
+        let Some((workspace_index, tab_index)) = self.app.parse_tab_id(tab_id) else {
+            return Err(("tab_not_found", format!("tab {tab_id} not found")));
+        };
+        let Some(client) = self.clients.get(&client_id) else {
+            return Err(("client_missing", "the requesting client is gone".into()));
+        };
+        let (cols, rows) = client.terminal_size;
+        let cell_size = client.cell_size;
+        let target = crate::ui::TabSurfaceTarget {
+            workspace_index,
+            tab_index,
+        };
+        let (buffer, _, _, _) = crate::server::render_stream::render_tab_surface_virtual(
+            &self.app.state,
+            &self.app.terminal_runtimes,
+            Some(target),
+            Rect::new(0, 0, cols, rows),
+            false,
+            cell_size,
+        );
+        let frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        // Rendering cleared the dirty rows that retained patches for this tab
+        // are built from, so any client showing it must take a full frame next.
+        let viewing = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.is_shell_client())
+            .map(|(&id, _)| id)
+            .filter(|&id| self.shell_target_for_client(id) == Some(target))
+            .collect::<Vec<_>>();
+        for id in &viewing {
+            if let Some(client) = self.clients.get_mut(id) {
+                client.defer_full_render();
+            }
+        }
+        Ok((
+            api::schema::ResponseResult::ClientShellSurface {
+                tab_id: tab_id.to_owned(),
+                cols,
+                rows,
+                lines: crate::server::client_shell::surface_lines(&frame),
+            },
+            !viewing.is_empty(),
+        ))
     }
 }
