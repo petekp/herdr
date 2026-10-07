@@ -494,12 +494,8 @@ impl ClientShellState {
         now: std::time::Instant,
         outcome: &mut ClientShellInput,
     ) {
-        let mut origin = match (self.tab_swipe.as_ref(), self.snapshot.as_deref()) {
-            (Some(swipe), _) => Some(swipe.origin_tab_id.clone()),
-            (None, Some(snapshot)) => snapshot.focused_tab_id.clone(),
-            (None, None) => return,
-        };
-        // A restart replays the event into a new gesture, so at most two passes.
+        // A restart replays the event into the restarted gesture, so at most
+        // two passes.
         for _ in 0..2 {
             let Some(snapshot) = self.snapshot.as_deref() else {
                 return;
@@ -507,7 +503,12 @@ impl ClientShellState {
             let Some(workspace_id) = snapshot.focused_workspace_id.as_deref() else {
                 return;
             };
-            let Some(origin_id) = origin.take() else {
+            let Some(origin_id) = self
+                .tab_swipe
+                .as_ref()
+                .map(|swipe| swipe.origin_tab_id.clone())
+                .or_else(|| snapshot.focused_tab_id.clone())
+            else {
                 return;
             };
             // Borrowed from the snapshot: a dense swipe pushes an event per
@@ -548,11 +549,10 @@ impl ClientShellState {
                     );
                     return;
                 }
-                super::tab_swipe::TabSwipePush::Restart => {
+                super::tab_swipe::TabSwipePush::Restart(next_origin) => {
                     // The new swipe starts from the tab the last one switched to,
                     // even if the snapshot has not caught up yet.
-                    origin = target;
-                    self.tab_swipe = None;
+                    swipe.restart(next_origin, now);
                     outcome.repaint = true;
                 }
             }

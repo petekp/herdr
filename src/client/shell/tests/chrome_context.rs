@@ -730,6 +730,42 @@ fn a_vertical_scroll_with_sideways_drift_over_a_pane_never_switches_tabs() {
 }
 
 #[test]
+fn slow_events_after_a_restart_within_a_trackpad_swipe_are_not_a_wheel_notch() {
+    // A trackpad swipe commits and its momentum keeps coming. Fingers back
+    // down the other way restart the gesture. What the stream has shown about
+    // the device carries over, so two sparse events start a slow swipe back
+    // instead of switching tabs at once like a wheel notch.
+    use crate::client::shell::tab_swipe::{MACOS_TAIL_GAPS, TAB_SWIPE_THRESHOLD};
+    use MouseEventKind::{ScrollLeft as Left, ScrollRight as Right};
+    let mut state = three_tab_state("tab_2");
+    let tab = state.hits.tabs[1].0;
+    let point = (tab.x, tab.y);
+    let mut at = std::time::Instant::now();
+    for _ in 1..TAB_SWIPE_THRESHOLD {
+        at += std::time::Duration::from_millis(8);
+        wheel_at_instant(&mut state, Right, point, at);
+    }
+    at += std::time::Duration::from_millis(8);
+    let commit = wheel_at_instant(&mut state, Right, point, at);
+    assert_eq!(focused_tab_request(&commit).as_deref(), Some("tab_3"));
+    for gap in MACOS_TAIL_GAPS {
+        at += std::time::Duration::from_millis(gap);
+        let tail = wheel_at_instant(&mut state, Right, point, at);
+        assert_eq!(focused_tab_request(&tail), None, "momentum switched tabs");
+    }
+    for _ in 0..2 {
+        at += std::time::Duration::from_millis(80);
+        let back = wheel_at_instant(&mut state, Left, point, at);
+        assert_eq!(
+            focused_tab_request(&back),
+            None,
+            "a slow swipe back switched tabs like a wheel notch"
+        );
+    }
+    assert!(state.tab_swipe.is_some(), "the swipe back is in progress");
+}
+
+#[test]
 fn wrapping_swipe_drains_the_origin_and_fills_the_far_tab_from_its_edge() {
     let threshold = crate::client::shell::tab_swipe::TAB_SWIPE_THRESHOLD;
     let mut state = three_tab_state("tab_1");

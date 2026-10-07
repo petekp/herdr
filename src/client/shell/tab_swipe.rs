@@ -33,8 +33,8 @@ const RESUME_RATIO: f32 = 2.5;
 /// swipe while the last one cools down. A momentum tail's gaps grow the whole
 /// time; a finger moving slowly keeps them level.
 const STEADY_GAPS: usize = 12;
-/// How much the later half of those gaps may exceed the earlier half. Tails
-/// measured on macOS grow at least 1.5x between halves once they are sparse.
+/// How much the later half's median gap may exceed the earlier half's. Tails
+/// measured on macOS grow at least 1.35x between halves once they are sparse.
 const STEADY_GROWTH: f32 = 1.25;
 /// Most events one read may hold and still count toward a steady stream. A
 /// slow finger crosses at most a couple of cells between reads; a stalled
@@ -60,8 +60,9 @@ pub(super) struct TabSwipe {
     last_input: Instant,
     last_event: Option<Instant>,
     dense_events: u32,
-    /// A vertical wheel event arrived while this swipe was alive. A wheel
-    /// tilts or scrolls, never both at once, so this rules out the notch path.
+    /// A vertical wheel event arrived while this swipe or the one it restarted
+    /// from was alive. A wheel tilts or scrolls, never both at once, so this
+    /// rules out the notch path.
     saw_vertical: bool,
     /// Reads that carried events for this gesture, oldest first.
     reads: VecDeque<InputRead>,
@@ -139,9 +140,9 @@ pub(super) enum TabSwipePush {
     /// The threshold was reached; focus this tab.
     Commit(String),
     /// A fresh swipe arrived while the previous one was still finishing.
-    /// The caller starts a new gesture from the committed target and replays
-    /// the event into it.
-    Restart,
+    /// The caller restarts the gesture from this tab, the one the last swipe
+    /// switched to, and replays the event into it.
+    Restart(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,6 +204,20 @@ impl TabSwipe {
         }
     }
 
+    /// Starts the next gesture on the same wheel stream, from the tab the
+    /// last one switched to. The gesture starts over, but the stream has not
+    /// changed device, so the dense gaps and vertical events it has shown
+    /// still rule out the notch path. The last event time stays behind: the
+    /// caller replays the event that caused the restart as the new gesture's
+    /// first, so a wheel takes two notches per tab after the first switch.
+    pub(super) fn restart(&mut self, origin_tab_id: String, now: Instant) {
+        *self = Self {
+            dense_events: self.dense_events,
+            saw_vertical: self.saw_vertical,
+            ..Self::begin(self.workspace_id.clone(), origin_tab_id, now)
+        };
+    }
+
     /// Which way the swipe is moving, or `None` while it is at rest.
     pub(super) fn direction(&self) -> Option<TabSwipeDirection> {
         TabSwipeDirection::of_steps(self.steps)
@@ -262,11 +277,16 @@ impl TabSwipe {
                 self.phase = TabSwipePhase::Tracking;
             }
             TabSwipePhase::Landing { commit, .. } | TabSwipePhase::Cooldown { commit } => {
+                // A committed swipe always has a target; without one there is
+                // nothing to restart from.
+                let Some(target) = self.target.as_ref() else {
+                    return TabSwipePush::Continue;
+                };
                 // A notch cannot be momentum: nothing coasts at wheel rates.
                 // It starts the next swipe at once, so a wheel keeps switching
                 // tabs for as long as it keeps turning.
                 if discrete_notch || self.fresh_swipe(direction, commit, now) {
-                    return TabSwipePush::Restart;
+                    return TabSwipePush::Restart(target.tab_id.clone());
                 }
                 return TabSwipePush::Continue;
             }
@@ -411,20 +431,21 @@ impl TabSwipe {
         if reads.clone().any(|read| read.events > STEADY_READ_EVENTS) {
             return false;
         }
-        let gaps = reads
-            .clone()
-            .zip(reads.skip(1))
-            .map(|(earlier, later)| later.at.duration_since(earlier.at))
-            .collect::<Vec<_>>();
-        let mut sorted = gaps.clone();
+        let mut gaps = [Duration::ZERO; STEADY_GAPS];
+        for (gap, (earlier, later)) in gaps.iter_mut().zip(reads.clone().zip(reads.skip(1))) {
+            *gap = later.at.duration_since(earlier.at);
+        }
+        let mut sorted = gaps;
         sorted.sort_unstable();
-        if WheelPace::of(sorted[STEADY_GAPS / 2]) == WheelPace::Dense {
+        if WheelPace::of(median(&sorted)) == WheelPace::Dense {
             return false;
         }
-        // The halves are the same length, so their sums compare like means.
-        let (earlier, later) = gaps.split_at(STEADY_GAPS / 2);
-        let total = |half: &[Duration]| half.iter().sum::<Duration>().as_secs_f32();
-        total(later) <= STEADY_GROWTH * total(earlier)
+        // Medians, not sums: one read out of step, split around a vertical
+        // event or held up by the client, must not pass a tail as level.
+        let (earlier, later) = gaps.split_at_mut(STEADY_GAPS / 2);
+        earlier.sort_unstable();
+        later.sort_unstable();
+        median(later) <= median(earlier).mul_f32(STEADY_GROWTH)
     }
 
     pub(super) fn tick(&mut self, now: Instant) -> TabSwipeTick {
@@ -488,6 +509,19 @@ impl TabSwipe {
         }
     }
 }
+
+/// Median of a sorted, non-empty slice.
+fn median(sorted: &[Duration]) -> Duration {
+    (sorted[(sorted.len() - 1) / 2] + sorted[sorted.len() / 2]) / 2
+}
+
+/// Gaps in milliseconds of the momentum tail after a fast trackpad swipe,
+/// as Ghostty on macOS delivers it: one wheel event per cell of travel, so
+/// the gaps step up in frame multiples as the scroll slows.
+#[cfg(test)]
+pub(super) const MACOS_TAIL_GAPS: [u64; 17] = [
+    17, 17, 17, 17, 17, 17, 16, 17, 25, 25, 25, 24, 34, 33, 41, 67, 167,
+];
 
 #[cfg(test)]
 mod tests {
@@ -663,24 +697,23 @@ mod tests {
         assert!(swipe.tick(at + TAB_SWIPE_IDLE).finished);
     }
 
-    /// Gaps in milliseconds of the momentum tail after a fast trackpad swipe,
-    /// as Ghostty on macOS delivers it: one wheel event per cell of travel, so
-    /// the gaps step up in frame multiples as the scroll slows.
-    const MACOS_TAIL_GAPS: [u64; 17] = [
-        17, 17, 17, 17, 17, 17, 16, 17, 25, 25, 25, 24, 34, 33, 41, 67, 167,
-    ];
-
-    #[test]
-    fn a_slow_swipe_during_the_momentum_tail_starts_a_new_gesture() {
+    /// A swipe toward the next tab that committed 320ms ago while the finger
+    /// kept moving, and the time of its last event.
+    fn committed_swipe_still_moving() -> (TabSwipe, Instant) {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
         let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
-        // The finger keeps moving for a while after the commit.
         for _ in 0..40 {
             at += Duration::from_millis(8);
             assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
             swipe.tick(at);
         }
+        (swipe, at)
+    }
+
+    #[test]
+    fn a_slow_swipe_during_the_momentum_tail_starts_a_new_gesture() {
+        let (mut swipe, mut at) = committed_swipe_still_moving();
         // The whole tail on its own never restarts the gesture.
         let mut tail_only = swipe.clone();
         let mut t = at;
@@ -702,7 +735,7 @@ mod tests {
                 !swipe.tick(at).finished,
                 "slow input keeps the gesture alive"
             );
-            if swipe.push(Next, neighbors(), at) == TabSwipePush::Restart {
+            if swipe.push(Next, neighbors(), at) == TabSwipePush::Restart("tab_next".into()) {
                 restarted_after = Some(index);
                 break;
             }
@@ -711,6 +744,54 @@ mod tests {
             matches!(restarted_after, Some(1..=12)),
             "restarted after {restarted_after:?} slow events"
         );
+    }
+
+    /// Reads of one momentum tail after a fast trackpad swipe, as Ghostty on
+    /// macOS delivers it: the gap in milliseconds since the previous read and
+    /// the events it carried. Vertical drift events landed between some of
+    /// the later ones and split a read in two; the 1ms gap stands for two
+    /// reads under a millisecond apart.
+    const MACOS_TAIL_READS: [(u64, u32); 24] = [
+        (8, 2),
+        (8, 2),
+        (9, 2),
+        (7, 2),
+        (8, 2),
+        (16, 2),
+        (18, 2),
+        (16, 2),
+        (17, 2),
+        (17, 2),
+        (17, 2),
+        (17, 2),
+        (17, 2),
+        (24, 2),
+        (25, 1),
+        (1, 1),
+        (25, 2),
+        (25, 2),
+        (36, 2),
+        (32, 2),
+        (25, 1),
+        (8, 1),
+        (68, 2),
+        (100, 2),
+    ];
+
+    #[test]
+    fn a_momentum_tail_with_split_reads_is_not_a_slow_swipe() {
+        let (mut swipe, mut at) = committed_swipe_still_moving();
+        for (gap, events) in MACOS_TAIL_READS {
+            at += Duration::from_millis(gap);
+            for _ in 0..events {
+                assert_eq!(
+                    swipe.push(Next, neighbors(), at),
+                    TabSwipePush::Continue,
+                    "restarted on the read {gap}ms after the previous one"
+                );
+            }
+            swipe.tick(at);
+        }
     }
 
     #[test]
@@ -725,7 +806,7 @@ mod tests {
         let later = at + RESUME_MIN_AGE;
         assert_eq!(
             swipe.push(Previous, neighbors(), later),
-            TabSwipePush::Restart
+            TabSwipePush::Restart("tab_next".into())
         );
     }
 
@@ -734,14 +815,14 @@ mod tests {
         let now = Instant::now();
         let mut swipe = TabSwipe::begin("ws".into(), "tab_origin".into(), now);
         let (mut at, _) = trackpad(&mut swipe, Next, TAB_SWIPE_THRESHOLD, now);
-        // Sparse momentum tail for 300ms.
-        for _ in 0..10 {
-            at += Duration::from_millis(30);
+        // Momentum tail for 300ms.
+        for gap in &MACOS_TAIL_GAPS[..14] {
+            at += Duration::from_millis(*gap);
             assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         }
         // Fingers come back: a dense burst.
         let (_, results) = trackpad(&mut swipe, Next, 20, at + Duration::from_millis(4));
-        assert!(results.contains(&TabSwipePush::Restart));
+        assert!(results.contains(&TabSwipePush::Restart("tab_next".into())));
     }
 
     #[test]
@@ -761,7 +842,7 @@ mod tests {
         assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Continue);
         let (_, results) = trackpad(&mut swipe, Next, 20, at + Duration::from_millis(4));
-        assert!(results.contains(&TabSwipePush::Restart));
+        assert!(results.contains(&TabSwipePush::Restart("tab_next".into())));
     }
 
     #[test]
@@ -777,9 +858,10 @@ mod tests {
         // Later notches keep switching instead of being swallowed as momentum,
         // in either direction.
         at += Duration::from_millis(80);
-        assert_eq!(swipe.push(Next, neighbors(), at), TabSwipePush::Restart);
+        let restart = TabSwipePush::Restart("tab_next".into());
+        assert_eq!(swipe.push(Next, neighbors(), at), restart);
         at += Duration::from_millis(80);
-        assert_eq!(swipe.push(Previous, neighbors(), at), TabSwipePush::Restart);
+        assert_eq!(swipe.push(Previous, neighbors(), at), restart);
     }
 
     #[test]
