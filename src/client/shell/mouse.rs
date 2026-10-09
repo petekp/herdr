@@ -495,7 +495,8 @@ impl ClientShellState {
         outcome: &mut ClientShellInput,
     ) {
         // A restart replays the event into the restarted gesture, so at most
-        // two passes.
+        // two passes. A dense swipe pushes an event per wheel report, so the
+        // passes borrow the strip and the tab ids instead of copying them.
         for _ in 0..2 {
             let Some(snapshot) = self.snapshot.as_deref() else {
                 return;
@@ -503,37 +504,45 @@ impl ClientShellState {
             let Some(workspace_id) = snapshot.focused_workspace_id.as_deref() else {
                 return;
             };
-            let Some(origin_id) = self
-                .tab_swipe
-                .as_ref()
-                .map(|swipe| swipe.origin_tab_id.clone())
-                .or_else(|| snapshot.focused_tab_id.clone())
-            else {
-                return;
+            let swipe = match self.tab_swipe.as_mut() {
+                Some(swipe) => swipe,
+                None => {
+                    let Some(origin_id) = snapshot.focused_tab_id.clone() else {
+                        return;
+                    };
+                    self.tab_swipe.insert(super::tab_swipe::TabSwipe::begin(
+                        workspace_id.to_owned(),
+                        origin_id,
+                        now,
+                    ))
+                }
             };
-            // Borrowed from the snapshot: a dense swipe pushes an event per
-            // wheel report, so the strip is not copied for each one.
             let tab_ids = snapshot
                 .tabs
                 .iter()
                 .filter(|tab| tab.workspace_id == workspace_id)
-                .map(|tab| tab.tab_id.as_str())
-                .collect::<Vec<_>>();
-            let Some(origin_index) = tab_ids.iter().position(|tab_id| *tab_id == origin_id) else {
+                .map(|tab| tab.tab_id.as_str());
+            let Some(neighbors) =
+                super::tab_swipe::TabSwipeNeighbors::around(tab_ids, &swipe.origin_tab_id)
+            else {
                 self.tab_swipe = None;
                 return;
             };
-            let neighbors = super::tab_swipe::TabSwipeNeighbors::around(&tab_ids, origin_index);
-            let swipe = self.tab_swipe.get_or_insert_with(|| {
-                super::tab_swipe::TabSwipe::begin(workspace_id.to_owned(), origin_id, now)
-            });
             let before = swipe.progress;
             let push = swipe.push(direction, neighbors, now);
             let moved = swipe.progress != before;
-            let target = swipe.target.as_ref().map(|target| target.tab_id.clone());
             match push {
                 super::tab_swipe::TabSwipePush::Continue => {
                     outcome.repaint |= moved;
+                    // The surface is requested once per target, so the id is
+                    // copied only on the event that asks for it.
+                    let target = self
+                        .tab_swipe
+                        .as_ref()
+                        .and_then(|swipe| swipe.target.as_ref())
+                        .map(|target| target.tab_id.as_str())
+                        .filter(|target| !self.neighbor_surface_requested(target))
+                        .map(str::to_owned);
                     if let Some(target) = target {
                         self.request_neighbor_surface(&target, outcome);
                     }

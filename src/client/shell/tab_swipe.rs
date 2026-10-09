@@ -163,27 +163,42 @@ pub(super) struct TabSwipeNeighbors<'a> {
 }
 
 impl<'a> TabSwipeNeighbors<'a> {
-    /// Neighbors of `tab_ids[origin]`. With two or more tabs the strip wraps,
-    /// so both neighbors always exist; a lone tab has none.
-    pub(super) fn around(tab_ids: &[&'a str], origin: usize) -> Self {
-        let count = tab_ids.len();
-        if count < 2 || origin >= count {
-            return Self::default();
+    /// Neighbors of `origin` in the strip `tab_ids`, or `None` when the strip
+    /// does not hold it. With two or more tabs the strip wraps, so both
+    /// neighbors always exist; a lone tab has none. One pass, so a dense
+    /// swipe can look its neighbors up on every wheel event without copying
+    /// the strip.
+    pub(super) fn around(tab_ids: impl IntoIterator<Item = &'a str>, origin: &str) -> Option<Self> {
+        let mut count = 0;
+        let mut first = None;
+        let mut last = None;
+        let mut before = None;
+        let mut after = None;
+        let mut found = false;
+        for tab_id in tab_ids {
+            count += 1;
+            first.get_or_insert(tab_id);
+            if tab_id == origin {
+                found = true;
+            } else if !found {
+                before = Some(tab_id);
+            } else if after.is_none() {
+                after = Some(tab_id);
+            }
+            last = Some(tab_id);
         }
-        let previous_wraps = origin == 0;
-        let next_wraps = origin + 1 == count;
-        let previous = if previous_wraps {
-            count - 1
-        } else {
-            origin - 1
-        };
-        let next = if next_wraps { 0 } else { origin + 1 };
-        Self {
-            previous: tab_ids.get(previous).copied(),
-            next: tab_ids.get(next).copied(),
-            previous_wraps,
-            next_wraps,
+        if !found {
+            return None;
         }
+        if count < 2 {
+            return Some(Self::default());
+        }
+        Some(Self {
+            previous: before.or(last),
+            next: after.or(first),
+            previous_wraps: before.is_none(),
+            next_wraps: after.is_none(),
+        })
     }
 }
 
@@ -647,21 +662,21 @@ mod tests {
     #[test]
     fn neighbors_wrap_around_the_strip() {
         let tabs = ["a", "b", "c"];
-        let first = TabSwipeNeighbors::around(&tabs, 0);
+        let around = |origin| TabSwipeNeighbors::around(tabs, origin).expect("origin in strip");
+        let first = around("a");
         assert_eq!((first.previous, first.next), (Some("c"), Some("b")));
         assert!(first.previous_wraps && !first.next_wraps);
-        let middle = TabSwipeNeighbors::around(&tabs, 1);
+        let middle = around("b");
         assert_eq!((middle.previous, middle.next), (Some("a"), Some("c")));
         assert!(!middle.previous_wraps && !middle.next_wraps);
-        let last = TabSwipeNeighbors::around(&tabs, 2);
+        let last = around("c");
         assert_eq!((last.previous, last.next), (Some("b"), Some("a")));
         assert!(!last.previous_wraps && last.next_wraps);
+        assert!(TabSwipeNeighbors::around(tabs, "d").is_none());
         // A lone tab has nowhere to go; a pair reaches its one neighbor either way.
-        let lone = ["a"];
-        let lone = TabSwipeNeighbors::around(&lone, 0);
+        let lone = TabSwipeNeighbors::around(["a"], "a").expect("lone tab");
         assert_eq!((lone.previous, lone.next), (None, None));
-        let pair = ["a", "b"];
-        let pair = TabSwipeNeighbors::around(&pair, 0);
+        let pair = TabSwipeNeighbors::around(["a", "b"], "a").expect("first of pair");
         assert_eq!((pair.previous, pair.next), (Some("b"), Some("b")));
         assert!(pair.previous_wraps && !pair.next_wraps);
     }

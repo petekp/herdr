@@ -76,20 +76,25 @@ impl ClientShellState {
         })
     }
 
+    /// Whether `tab_id`'s surface is cached or on its way.
+    pub(super) fn neighbor_surface_requested(&self, tab_id: &str) -> bool {
+        let cached = self
+            .neighbor_surfaces
+            .iter()
+            .any(|neighbor| neighbor.tab_id == tab_id);
+        cached
+            || self.pending_requests.values().any(|pending| {
+                matches!(&pending.kind, PendingEndpointKind::NeighborSurface { tab_id: pending_tab } if pending_tab == tab_id)
+            })
+    }
+
     /// Asks the server for `tab_id`'s surface unless it is cached or on its way.
     pub(super) fn request_neighbor_surface(
         &mut self,
         tab_id: &str,
         outcome: &mut ClientShellInput,
     ) {
-        let cached = self
-            .neighbor_surfaces
-            .iter()
-            .any(|neighbor| neighbor.tab_id == tab_id);
-        let requested = self.pending_requests.values().any(|pending| {
-            matches!(&pending.kind, PendingEndpointKind::NeighborSurface { tab_id: pending_tab } if pending_tab == tab_id)
-        });
-        if cached || requested {
+        if self.neighbor_surface_requested(tab_id) {
             return;
         }
         let method =
